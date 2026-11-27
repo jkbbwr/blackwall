@@ -1,14 +1,19 @@
 # Composable GitHub mixin profile (e.g. `blackwall create --profile ts-dev --profile github`).
 #
-# Provides git + GitHub CLI (`gh`) and read-only / git-smart-HTTP egress to GitHub.
-# To enable authenticated `gh` API calls or `git push` without exposing your real PAT to the VM,
-# seal your token offline and layer it at create time (or in a private local overlay profile):
+# Provides git + GitHub CLI (`gh`) and HTTPS egress to GitHub (including `POST /graphql`
+# required by `gh`, and smart-HTTP git clone/fetch/push on `github.com`).
+# Note: SSH (port 22) is intentionally not proxied; use HTTPS + a sealed fine-grained PAT
+# so `blackwall-proxy` can inspect paths, inject auth from memfd_secret, and audit calls.
+#
+# For brokered `GITHUB_TOKEN` injection, seal your PAT offline and bind `auth` in a local
+# profile extending your language profile (without duplicating the unauthenticated `api.github.com` `/` rule):
 #
 #   SEALED=$(printf '%s' "$GH_PAT" | blackwall secret seal --raw \
 #     --name GITHUB_TOKEN --hosts api.github.com,github.com --paths / --exp-sec 7200)
-#   blackwall create --profile ts-dev --profile github \
+#   blackwall create --profile ts-dev \
 #     --secret "GITHUB_TOKEN=$SEALED" \
-#     --allow-http "GET,POST,PATCH:api.github.com/:GITHUB_TOKEN"
+#     --allow-http "GET,POST,PUT,PATCH:api.github.com/:GITHUB_TOKEN" \
+#     --allow-http "GET,HEAD,POST:github.com/:GITHUB_TOKEN"
 
 version = 1
 name = "github"
@@ -30,16 +35,16 @@ run = [
 [network]
 mode = "egress"
 
-# Smart HTTP git clone/fetch (`git-upload-pack` uses POST on `/*.git/git-upload-pack`)
+# Smart HTTP git clone/fetch/push (`git-upload-pack` & `git-receive-pack` use POST)
 [[network.http]]
 host = "github.com"
 methods = ["GET", "HEAD", "POST"]
 path_prefixes = ["/"]
 
-# Read-only GitHub REST API by default
+# GitHub REST + GraphQL API (`gh` uses POST /graphql even for reads)
 [[network.http]]
 host = "api.github.com"
-methods = ["GET", "HEAD"]
+methods = ["GET", "HEAD", "POST", "PUT", "PATCH"]
 path_prefixes = ["/"]
 
 [[network.http]]
