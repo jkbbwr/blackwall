@@ -639,9 +639,25 @@ export function buildProxyUrl(
   subPath = "/",
 ): string {
   const cleanSub = subPath.startsWith("/") ? subPath : `/${subPath}`;
-  const relative = `/v1/sandboxes/${encodeURIComponent(sandboxId)}/proxy/${port}${cleanSub}`;
   const origin = getPreviewOrigin();
-  return origin ? `${origin}${relative}` : relative;
+  if (origin) {
+    try {
+      const parsed = new URL(origin);
+      if (
+        parsed.hostname === "127.0.0.1" ||
+        parsed.hostname === "localhost" ||
+        parsed.hostname === "::1" ||
+        parsed.hostname === "[::1]"
+      ) {
+        const portSuffix = parsed.port ? `:${parsed.port}` : "";
+        return `${parsed.protocol}//${port}-${encodeURIComponent(sandboxId)}.localhost${portSuffix}${cleanSub}`;
+      }
+    } catch {
+      // Fall back to path-prefix preview URL if preview_origin isn't a standard URL.
+    }
+    return `${origin}/v1/sandboxes/${encodeURIComponent(sandboxId)}/proxy/${port}${cleanSub}`;
+  }
+  return `/v1/sandboxes/${encodeURIComponent(sandboxId)}/proxy/${port}${cleanSub}`;
 }
 
 export async function probeProxyPort(

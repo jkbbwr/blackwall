@@ -624,5 +624,9 @@ pub async fn preview_security_headers_middleware(req: Request, next: Next) -> Re
         HeaderName::from_static("referrer-policy"),
         HeaderValue::from_static("no-referrer"),
     );
+    headers.insert(
+        HeaderName::from_static("origin-agent-cluster"),
+        HeaderValue::from_static("?1"),
+    );
     resp
 }

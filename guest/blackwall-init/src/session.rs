@@ -738,25 +738,33 @@ where
                 send_resp(&writer, &CtrlResponse::Ack { req_id })?;
             }
 
-            CtrlRequest::HostBridgeAccepted {
-                stream_id,
-                ok,
-                reason,
-            } => {
+            CtrlRequest::HostBridgeAccepted { stream_id } => {
                 let pending = state
                     .pending_bridge_accepts
                     .lock()
                     .unwrap()
                     .remove(&stream_id);
                 if let Some(pending) = pending {
-                    if ok && !state.shutting_down.load(Ordering::Acquire) {
+                    let allowed = !state.shutting_down.load(Ordering::Acquire);
+                    if allowed {
                         state
                             .tcp_tunnels
                             .lock()
                             .unwrap()
                             .insert(stream_id, pending.tunnel);
                     }
-                    let _ = pending.tx.send((ok, reason));
+                    let _ = pending.tx.send((allowed, None));
+                }
+            }
+
+            CtrlRequest::HostBridgeRejected { stream_id, reason } => {
+                let pending = state
+                    .pending_bridge_accepts
+                    .lock()
+                    .unwrap()
+                    .remove(&stream_id);
+                if let Some(pending) = pending {
+                    let _ = pending.tx.send((false, Some(reason)));
                 }
             }
 
@@ -2240,8 +2248,6 @@ mod tests {
             &mut client,
             &CtrlRequest::HostBridgeAccepted {
                 stream_id: stream_id.clone(),
-                ok: true,
-                reason: None,
             },
         )
         .unwrap();
@@ -2282,7 +2288,7 @@ mod tests {
         }
         guest_thread.join().unwrap();
 
-        // 4. Guest TCP client rejected via HostBridgeAccepted(ok=false) closes cleanly.
+        // 4. Guest TCP client rejected via HostBridgeRejected closes cleanly.
         let rejected_guest = thread::spawn(move || {
             let mut conn = TcpStream::connect(("127.0.0.1", port)).unwrap();
             conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -2307,10 +2313,9 @@ mod tests {
 
         write_ctrl_request(
             &mut client,
-            &CtrlRequest::HostBridgeAccepted {
+            &CtrlRequest::HostBridgeRejected {
                 stream_id: rejected_stream_id,
-                ok: false,
-                reason: Some("host refused".into()),
+                reason: "host refused".into(),
             },
         )
         .unwrap();

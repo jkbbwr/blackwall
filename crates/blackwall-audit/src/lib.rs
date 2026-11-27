@@ -13,7 +13,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -231,17 +231,173 @@ impl AuditSink for MemoryAuditSink {
 
 /// Ingest a unidirectional Port 1001 stream until EOF, forwarding each
 /// `GuestAuditFrame` to `sink`.
+const MAX_GUEST_AUDIT_FIELD_BYTES: usize = 128;
+const MAX_GUEST_AUDIT_DETAILS_BYTES: usize = 4096;
+const PORT1001_RATE_BURST: f64 = 64.0;
+const PORT1001_RATE_PER_SEC: f64 = 20.0;
+
+/// Strip ANSI CSI/OSC escape sequences and ASCII control characters, truncating to `max_bytes`
+/// on a valid UTF-8 boundary.
+fn sanitize_guest_string(input: &str, max_bytes: usize) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len().min(max_bytes));
+    let mut i = 0;
+    while i < bytes.len() && out.len() < max_bytes {
+        if bytes[i] == 0x1b {
+            // Skip CSI (`ESC [ ... final`) or OSC (`ESC ] ... BEL/ST`) sequences.
+            i += 1;
+            if i < bytes.len() && bytes[i] == b'[' {
+                i += 1;
+                while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1;
+                }
+                continue;
+            } else if i < bytes.len() && bytes[i] == b']' {
+                i += 1;
+                while i < bytes.len() && bytes[i] != 0x07 {
+                    if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+                if i < bytes.len() && bytes[i] == 0x07 {
+                    i += 1;
+                }
+                continue;
+            }
+            continue;
+        }
+        let Some(ch) = input[i..].chars().next() else {
+            break;
+        };
+        let ch_len = ch.len_utf8();
+        i += ch_len;
+        if ch.is_control() {
+            if matches!(ch, '\n' | '\r' | '\t') && out.len() < max_bytes {
+                out.push(' ');
+            }
+            continue;
+        }
+        if out.len() + ch_len > max_bytes {
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn sanitize_guest_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(s) => {
+            serde_json::Value::String(sanitize_guest_string(&s, 1024))
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().take(64).map(sanitize_guest_json).collect())
+        }
+        serde_json::Value::Object(map) => {
+            let clean = map
+                .into_iter()
+                .take(64)
+                .map(|(k, v)| (sanitize_guest_string(&k, 64), sanitize_guest_json(v)))
+                .collect();
+            serde_json::Value::Object(clean)
+        }
+        other => other,
+    }
+}
+
+/// Sanitize an untrusted Port 1001 [`GuestAuditFrame`] before recording it on the host.
+pub fn sanitize_guest_audit_frame(frame: GuestAuditFrame) -> GuestAuditFrame {
+    let source = sanitize_guest_string(&frame.source, MAX_GUEST_AUDIT_FIELD_BYTES);
+    let kind = sanitize_guest_string(&frame.kind, MAX_GUEST_AUDIT_FIELD_BYTES);
+    let sanitized_payload = sanitize_guest_json(frame.payload);
+    let payload = match serde_json::to_string(&sanitized_payload) {
+        Ok(encoded) if encoded.len() <= MAX_GUEST_AUDIT_DETAILS_BYTES => sanitized_payload,
+        _ => serde_json::json!({ "truncated": true }),
+    };
+    GuestAuditFrame {
+        timestamp_ns: frame.timestamp_ns,
+        source,
+        kind,
+        payload,
+    }
+}
+
+struct Port1001RateLimiter {
+    tokens: f64,
+    last_refill: Instant,
+    throttled_notified: bool,
+}
+
+impl Port1001RateLimiter {
+    fn new() -> Self {
+        Self {
+            tokens: PORT1001_RATE_BURST,
+            last_refill: Instant::now(),
+            throttled_notified: false,
+        }
+    }
+
+    fn allow(&mut self) -> (bool, bool) {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        if elapsed > 0.0 {
+            self.tokens = (self.tokens + elapsed * PORT1001_RATE_PER_SEC).min(PORT1001_RATE_BURST);
+            self.last_refill = now;
+        }
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            if self.tokens > PORT1001_RATE_BURST / 2.0 {
+                self.throttled_notified = false;
+            }
+            (true, false)
+        } else {
+            let emit_warning = !self.throttled_notified;
+            self.throttled_notified = true;
+            (false, emit_warning)
+        }
+    }
+}
+
+/// Drain unidirectional Port 1001 guest audit frames from `reader` into `sink`,
+/// enforcing `AuditOrigin::GuestUntrusted`, ANSI/control-char sanitization, field caps,
+/// and per-sandbox token-bucket rate limiting.
 pub fn drain_port1001_stream<R: std::io::Read>(
     mut reader: R,
     sandbox_id: &str,
     sink: &dyn AuditSink,
 ) -> usize {
     let mut count = 0;
+    let mut limiter = Port1001RateLimiter::new();
     while let Ok(frame) = blackwall_proto::read_audit_frame(&mut reader) {
-        sink.record(AuditEvent::now(
-            sandbox_id,
-            AuditEventKind::GuestPort1001 { frame },
-        ));
+        let (allowed, emit_warning) = limiter.allow();
+        if !allowed {
+            if emit_warning {
+                sink.record(
+                    AuditEvent::now(
+                        sandbox_id,
+                        AuditEventKind::SandboxLifecycle {
+                            phase: "guest_audit_throttled".into(),
+                            image_roothash: None,
+                            details: Some(
+                                "Port 1001 guest audit stream exceeded rate limit; excess frames dropped".into(),
+                            ),
+                        },
+                    )
+                    .with_origin(AuditOrigin::Daemon),
+                );
+            }
+            continue;
+        }
+        let clean = sanitize_guest_audit_frame(frame);
+        sink.record(
+            AuditEvent::now(sandbox_id, AuditEventKind::GuestPort1001 { frame: clean })
+                .with_origin(AuditOrigin::GuestUntrusted),
+        );
         count += 1;
     }
     count
@@ -427,5 +583,58 @@ mod tests {
         let text = serde_json::to_string(&denied).unwrap();
         let parsed: AuditEvent = serde_json::from_str(&text).unwrap();
         assert_eq!(parsed, denied);
+    }
+
+    #[test]
+    fn port1001_drain_sanitizes_ansi_tags_guest_untrusted_and_rate_limits_floods() {
+        let sink = MemoryAuditSink::new();
+        let mut wire = Vec::new();
+        // Frame 1: ANSI + control chars + oversized payload
+        let dirty = GuestAuditFrame {
+            timestamp_ns: 1,
+            source: "\x1b[31mblackwall-init\x1b[0m\n".into(),
+            kind: "boot\x1b]0;pwn\x07_ok".into(),
+            payload: serde_json::json!({ "msg": "\x1b[1;31mfake\x1b[0m", "pad": "A".repeat(8000) }),
+        };
+        blackwall_proto::write_audit_frame(&mut wire, &dirty).unwrap();
+
+        // Frames 2..=120: flood past burst cap (64)
+        for i in 0..120 {
+            let f = GuestAuditFrame {
+                timestamp_ns: i + 2,
+                source: "guest".into(),
+                kind: "spam".into(),
+                payload: serde_json::json!({ "i": i }),
+            };
+            blackwall_proto::write_audit_frame(&mut wire, &f).unwrap();
+        }
+
+        let accepted = drain_port1001_stream(Cursor::new(&wire), "bw-flood", &sink);
+        assert!(accepted <= 65, "expected burst throttling, accepted {accepted}");
+
+        let events = sink.snapshot();
+        // First event must be GuestUntrusted with ANSI stripped and oversized payload truncated
+        assert_eq!(events[0].origin, AuditOrigin::GuestUntrusted);
+        match &events[0].kind {
+            AuditEventKind::GuestPort1001 { frame } => {
+                assert_eq!(frame.source, "blackwall-init ");
+                assert_eq!(frame.kind, "boot_ok");
+                assert!(!frame.source.contains('\x1b'));
+                assert!(!frame.kind.contains('\x1b'));
+            }
+            other => panic!("expected GuestPort1001, got {other:?}"),
+        }
+        // Throttle warning emitted once with Daemon origin
+        let throttle_warnings: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                e.origin == AuditOrigin::Daemon
+                    && matches!(
+                        &e.kind,
+                        AuditEventKind::SandboxLifecycle { phase, .. } if phase == "guest_audit_throttled"
+                    )
+            })
+            .collect();
+        assert_eq!(throttle_warnings.len(), 1);
     }
 }

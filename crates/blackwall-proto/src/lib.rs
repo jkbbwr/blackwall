@@ -454,8 +454,10 @@ pub enum CtrlRequest {
     },
     HostBridgeAccepted {
         stream_id: String,
-        ok: bool,
-        reason: Option<String>,
+    },
+    HostBridgeRejected {
+        stream_id: String,
+        reason: String,
     },
     Shutdown {
         req_id: u64,
@@ -784,18 +786,15 @@ mod tests {
             (
                 CtrlRequest::HostBridgeAccepted {
                     stream_id: "hb-1".into(),
-                    ok: true,
-                    reason: None,
                 },
                 "host_bridge_accepted",
             ),
             (
-                CtrlRequest::HostBridgeAccepted {
+                CtrlRequest::HostBridgeRejected {
                     stream_id: "hb-2".into(),
-                    ok: false,
-                    reason: Some("connection refused".into()),
+                    reason: "connection refused".into(),
                 },
-                "host_bridge_accepted",
+                "host_bridge_rejected",
             ),
         ] {
             let val = serde_json::to_value(&req).unwrap();

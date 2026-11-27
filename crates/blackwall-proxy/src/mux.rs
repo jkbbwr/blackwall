@@ -126,6 +126,9 @@ pub enum PostgresRouteTarget {
     Tcp(SocketAddr),
 }
 
+const MAX_ACTIVE_MUX_STREAMS: usize = 256;
+const MAX_DNS_FQDN_LEN: usize = 253;
+
 /// Port 1000 (`NET_MUX`) stream demultiplexer bridging `blackwall-netbridge` streams
 /// to synthetic DNS, the local Pingora HTTP proxy, and the sibling Postgres proxy.
 pub struct Port1000Muxer {
@@ -198,6 +201,10 @@ impl Port1000Muxer {
                             continue;
                         }
                     };
+                    if query.fqdn.len() > MAX_DNS_FQDN_LEN {
+                        let _ = send_rst(&out_tx, sid, StreamType::DnsResponse).await;
+                        continue;
+                    }
                     let resp = self.dns_table.resolve(&query);
                     if let Some((sandbox_id, audit_sink)) = &self.audit {
                         audit_sink.record(AuditEvent::now(
@@ -209,17 +216,33 @@ impl Port1000Muxer {
                             },
                         ));
                     }
-                    let resp_bytes = serde_json::to_vec(&resp)?;
-                    let reply = MuxFrame::new(
+                    let Ok(resp_bytes) = serde_json::to_vec(&resp) else {
+                        let _ = send_rst(&out_tx, sid, StreamType::DnsResponse).await;
+                        continue;
+                    };
+                    match MuxFrame::new(
                         sid,
                         mux_flags::DATA | mux_flags::FIN,
                         StreamType::DnsResponse,
                         resp_bytes,
-                    )?;
-                    let _ = out_tx.send(reply).await;
+                    ) {
+                        Ok(reply) => {
+                            let _ = out_tx.send(reply).await;
+                        }
+                        Err(_) => {
+                            let _ = send_rst(&out_tx, sid, StreamType::DnsResponse).await;
+                        }
+                    }
                 }
                 StreamType::Tcp => {
                     if (flags & mux_flags::SYN) != 0 {
+                        active_streams.retain(|_, tx| !tx.is_closed());
+                        if active_streams.contains_key(&sid)
+                            || active_streams.len() >= MAX_ACTIVE_MUX_STREAMS
+                        {
+                            let _ = send_rst(&out_tx, sid, StreamType::Tcp).await;
+                            continue;
+                        }
                         let open: StreamOpenPayload = match serde_json::from_slice(&frame.payload) {
                             Ok(o) => o,
                             Err(_) => {
@@ -248,14 +271,18 @@ impl Port1000Muxer {
                             }
                         }
                     } else if (flags & mux_flags::DATA) != 0 {
+                        let mut stalled = false;
                         if let Some(tx) = active_streams.get(&sid) {
-                            if tx.send(frame.payload).await.is_err() {
-                                active_streams.remove(&sid);
+                            if tx.try_send(frame.payload).is_err() {
+                                stalled = true;
                             }
                         } else {
                             let _ = send_rst(&out_tx, sid, StreamType::Tcp).await;
                         }
-                        if (flags & mux_flags::FIN) != 0 {
+                        if stalled {
+                            active_streams.remove(&sid);
+                            let _ = send_rst(&out_tx, sid, StreamType::Tcp).await;
+                        } else if (flags & mux_flags::FIN) != 0 {
                             active_streams.remove(&sid);
                         }
                     } else if (flags & (mux_flags::FIN | mux_flags::RST)) != 0 {
@@ -264,6 +291,13 @@ impl Port1000Muxer {
                 }
                 StreamType::Postgres => {
                     if (flags & mux_flags::SYN) != 0 {
+                        active_streams.retain(|_, tx| !tx.is_closed());
+                        if active_streams.contains_key(&sid)
+                            || active_streams.len() >= MAX_ACTIVE_MUX_STREAMS
+                        {
+                            let _ = send_rst(&out_tx, sid, StreamType::Postgres).await;
+                            continue;
+                        }
                         let open: StreamOpenPayload = match serde_json::from_slice(&frame.payload) {
                             Ok(o) => o,
                             Err(_) => {
@@ -326,14 +360,18 @@ impl Port1000Muxer {
                             }
                         }
                     } else if (flags & mux_flags::DATA) != 0 {
+                        let mut stalled = false;
                         if let Some(tx) = active_streams.get(&sid) {
-                            if tx.send(frame.payload).await.is_err() {
-                                active_streams.remove(&sid);
+                            if tx.try_send(frame.payload).is_err() {
+                                stalled = true;
                             }
                         } else {
                             let _ = send_rst(&out_tx, sid, StreamType::Postgres).await;
                         }
-                        if (flags & mux_flags::FIN) != 0 {
+                        if stalled {
+                            active_streams.remove(&sid);
+                            let _ = send_rst(&out_tx, sid, StreamType::Postgres).await;
+                        } else if (flags & mux_flags::FIN) != 0 {
                             active_streams.remove(&sid);
                         }
                     } else if (flags & (mux_flags::FIN | mux_flags::RST)) != 0 {

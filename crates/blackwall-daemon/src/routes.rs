@@ -11,7 +11,7 @@ use axum::body::Body;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Extension, Path, Query, Request, State};
-use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, COOKIE, HOST};
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, COOKIE, HOST, SET_COOKIE};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, delete, get, post, put};
@@ -28,11 +28,15 @@ use hyper_util::rt::TokioIo;
 use serde::Deserialize;
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::time::timeout;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 /// Maximum upload body size accepted by `PUT /v1/sandboxes/{id}/files` (512 MiB).
 pub const MAX_UPLOAD_BODY_BYTES: usize = 512 * 1024 * 1024;
+const PREVIEW_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+const PREVIEW_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 struct AppState {
@@ -142,9 +146,16 @@ pub fn build_http_control_plane_router(
 
 /// Construct the isolated preview HTTP router (`--preview-listen`).
 ///
-/// Serves ONLY `/v1/sandboxes/{id}/proxy/{port}*` with defensive response headers
-/// (`X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`) and ZERO
-/// control-plane routes.
+/// Serves:
+/// 1. Subdomain-isolated previews: `http://<port>-<sandbox-id>.localhost:<preview_port>/...`
+///    (and nested subdomains `<sub...>.<port>-<sandbox-id>.localhost:<preview_port>/...`),
+///    giving every `(sandbox_id, port)` its own browser Same-Origin boundary (`localStorage`,
+///    `IndexedDB`, `ServiceWorker`, and cookies) and serving guest apps natively at `/`.
+/// 2. Path-prefix fallback: `/v1/sandboxes/{id}/proxy/{port}*` (with `Set-Cookie` `Path` scoped
+///    to the sandbox prefix and `Domain=` stripped).
+///
+/// Serves ZERO control-plane routes and attaches `X-Content-Type-Options: nosniff`,
+/// `Referrer-Policy: no-referrer`, and `Origin-Agent-Cluster: ?1`.
 pub fn build_preview_router(manager: Arc<SandboxManager>) -> Router {
     let state = AppState { manager };
     Router::new()
@@ -154,6 +165,7 @@ pub fn build_preview_router(manager: Arc<SandboxManager>) -> Router {
             "/v1/sandboxes/{id}/proxy/{port}/{*rest}",
             any(proxy_http_subpath),
         )
+        .fallback(any(proxy_http_subdomain_fallback))
         .with_state(state)
         .layer(axum::middleware::from_fn(
             preview_security_headers_middleware,
@@ -740,12 +752,144 @@ async fn handle_tcp_tunnel_socket(socket: WebSocket, tunnel: TcpTunnelHandle) {
     let _ = tunnel_writer.close();
 }
 
+enum SetCookieScope<'a> {
+    /// Subdomain preview (`<port>-<sandbox-id>.localhost`): allow `Domain=` only when equal to or
+    /// nested under `allowed_domain`, otherwise strip `Domain=` to keep the cookie host-only.
+    Subdomain { allowed_domain: &'a str },
+    /// Path-prefix fallback (`/v1/sandboxes/{id}/proxy/{port}/`): always strip `Domain=` and force
+    /// `Path=/v1/sandboxes/{id}/proxy/{port}/`.
+    PathPrefix { forced_path: &'a str },
+}
+
+/// Parse `<port>-<sandbox-id>.localhost[:port]` (or `<sub...>.<port>-<sandbox-id>.localhost[:port]`)
+/// from an HTTP `Host` header, returning `(sandbox_id, guest_port, allowed_domain_root)`.
+fn parse_preview_subdomain_host(host_header: &str) -> Option<(String, u16, String)> {
+    let trimmed = host_header.trim();
+    if trimmed.is_empty() || trimmed.starts_with('[') {
+        return None;
+    }
+    let host_only = match trimmed.rsplit_once(':') {
+        Some((h, p)) if !h.contains(':') && p.parse::<u16>().is_ok() => h,
+        _ => trimmed,
+    };
+    let normalized = host_only.trim_end_matches('.').to_ascii_lowercase();
+    let prefix = normalized.strip_suffix(".localhost")?;
+    if prefix.is_empty() {
+        return None;
+    }
+    // Last label immediately before `.localhost` carries `<port>-<sandbox-id>`.
+    let root_label = prefix.rsplit('.').next()?;
+    let (port_str, sandbox_id) = root_label.split_once('-')?;
+    let port: u16 = port_str.parse().ok()?;
+    if port == 0 || sandbox_id.is_empty() {
+        return None;
+    }
+    if !sandbox_id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return None;
+    }
+    Some((
+        sandbox_id.to_string(),
+        port,
+        format!("{root_label}.localhost"),
+    ))
+}
+
+/// Sanitize a guest `Set-Cookie` header according to `scope` to prevent cross-sandbox cookie tossing.
+fn sanitize_set_cookie_header(raw: &str, scope: &SetCookieScope<'_>) -> Option<String> {
+    let mut parts = raw.split(';');
+    let first = parts.next()?.trim();
+    if first.is_empty() {
+        return None;
+    }
+    let mut out = vec![first.to_string()];
+    let mut has_path = false;
+
+    for attr in parts {
+        let trimmed = attr.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let (k, v_opt) = match trimmed.split_once('=') {
+            Some((k, v)) => (k.trim(), Some(v.trim())),
+            None => (trimmed, None),
+        };
+        if k.eq_ignore_ascii_case("domain") {
+            match scope {
+                SetCookieScope::Subdomain { allowed_domain } => {
+                    if let Some(v) = v_opt {
+                        let norm = v.trim_start_matches('.').trim_end_matches('.').to_ascii_lowercase();
+                        let allowed_nested = norm == *allowed_domain
+                            || norm.ends_with(&format!(".{allowed_domain}"));
+                        if allowed_nested {
+                            out.push(format!("Domain={norm}"));
+                        }
+                    }
+                    // Broader or invalid Domain= (e.g. `localhost`, `127.0.0.1`, other sandbox) is stripped.
+                }
+                SetCookieScope::PathPrefix { .. } => {
+                    // Strip Domain= on shared 127.0.0.1:7701 fallback.
+                }
+            }
+            continue;
+        }
+        if k.eq_ignore_ascii_case("path") {
+            match scope {
+                SetCookieScope::Subdomain { .. } => {
+                    out.push(trimmed.to_string());
+                }
+                SetCookieScope::PathPrefix { forced_path } => {
+                    if !has_path {
+                        out.push(format!("Path={forced_path}"));
+                        has_path = true;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(trimmed.to_string());
+    }
+
+    if let SetCookieScope::PathPrefix { forced_path } = scope {
+        if !has_path {
+            out.push(format!("Path={forced_path}"));
+        }
+    }
+
+    Some(out.join("; "))
+}
+
+async fn proxy_http_subdomain_fallback(
+    State(state): State<AppState>,
+    req: Request,
+) -> Result<Response, ApiError> {
+    let host_str = req
+        .headers()
+        .get(HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let Some((sandbox_id, port, allowed_domain)) = parse_preview_subdomain_host(host_str) else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    };
+    proxy_http_inner(
+        &state,
+        &sandbox_id,
+        port,
+        None,
+        Some(allowed_domain),
+        req,
+    )
+    .await
+}
+
 async fn proxy_http_root(
     State(state): State<AppState>,
     Path((id, port)): Path<(String, u16)>,
     req: Request,
 ) -> Result<Response, ApiError> {
-    proxy_http_inner(&state, &id, port, None, req).await
+    proxy_http_inner(&state, &id, port, None, None, req).await
 }
 
 async fn proxy_http_subpath(
@@ -753,7 +897,7 @@ async fn proxy_http_subpath(
     Path((id, port, rest)): Path<(String, u16, String)>,
     req: Request,
 ) -> Result<Response, ApiError> {
-    proxy_http_inner(&state, &id, port, Some(rest), req).await
+    proxy_http_inner(&state, &id, port, Some(rest), None, req).await
 }
 
 async fn proxy_http_inner(
@@ -761,6 +905,7 @@ async fn proxy_http_inner(
     id: &str,
     port: u16,
     rest: Option<String>,
+    subdomain_root: Option<String>,
     req: Request,
 ) -> Result<Response, ApiError> {
     if port == 0 {
@@ -772,20 +917,29 @@ async fn proxy_http_inner(
 
     let (parts, body) = req.into_parts();
     let prefix = format!("/v1/sandboxes/{id}/proxy/{port}");
-    let stripped_path = match parts.uri.path().strip_prefix(&prefix) {
-        Some("") | Some("/") => "/".to_string(),
-        Some(tail) if tail.starts_with('/') => tail.to_string(),
-        Some(tail) => format!("/{tail}"),
-        None => match rest {
-            Some(r) if !r.is_empty() => {
-                if r.starts_with('/') {
-                    r
-                } else {
-                    format!("/{r}")
+    let stripped_path = if subdomain_root.is_some() {
+        let p = parts.uri.path();
+        if p.is_empty() {
+            "/".to_string()
+        } else {
+            p.to_string()
+        }
+    } else {
+        match parts.uri.path().strip_prefix(&prefix) {
+            Some("") | Some("/") => "/".to_string(),
+            Some(tail) if tail.starts_with('/') => tail.to_string(),
+            Some(tail) => format!("/{tail}"),
+            None => match rest {
+                Some(r) if !r.is_empty() => {
+                    if r.starts_with('/') {
+                        r
+                    } else {
+                        format!("/{r}")
+                    }
                 }
-            }
-            _ => "/".to_string(),
-        },
+                _ => "/".to_string(),
+            },
+        }
     };
     let target_uri_str = match parts.uri.query() {
         Some(q) if !q.is_empty() => format!("{stripped_path}?{q}"),
@@ -796,15 +950,25 @@ async fn proxy_http_inner(
         .map_err(|e| ApiError::bad_request(format!("invalid proxy target URI: {e}")))?;
 
     let io = TokioIo::new(stream);
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
-        .await
-        .map_err(|e| {
-            ApiError::new(
-                StatusCode::BAD_GATEWAY,
-                "proxy_handshake_failed",
-                format!("guest HTTP handshake failed: {e}"),
-            )
-        })?;
+    let (mut sender, conn) = timeout(
+        PREVIEW_HANDSHAKE_TIMEOUT,
+        hyper::client::conn::http1::handshake(io),
+    )
+    .await
+    .map_err(|_| {
+        ApiError::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            "proxy_handshake_timeout",
+            "timed out waiting for guest HTTP handshake",
+        )
+    })?
+    .map_err(|e| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "proxy_handshake_failed",
+            format!("guest HTTP handshake failed: {e}"),
+        )
+    })?;
     tokio::spawn(async move {
         if let Err(err) = conn.await {
             tracing::debug!(%err, "guest HTTP reverse-proxy connection closed");
@@ -841,19 +1005,46 @@ async fn proxy_http_inner(
         .body(body)
         .map_err(|e| ApiError::bad_request(format!("failed to build proxied request: {e}")))?;
 
-    let upstream_resp = sender.send_request(upstream_req).await.map_err(|e| {
-        ApiError::new(
-            StatusCode::BAD_GATEWAY,
-            "proxy_upstream_error",
-            format!("guest HTTP proxy request failed: {e}"),
-        )
-    })?;
+    let upstream_resp = timeout(PREVIEW_RESPONSE_TIMEOUT, sender.send_request(upstream_req))
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::GATEWAY_TIMEOUT,
+                "proxy_upstream_timeout",
+                "timed out waiting for guest HTTP response",
+            )
+        })?
+        .map_err(|e| {
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "proxy_upstream_error",
+                format!("guest HTTP proxy request failed: {e}"),
+            )
+        })?;
+
+    let forced_path = format!("{prefix}/");
+    let cookie_scope = match subdomain_root.as_deref() {
+        Some(allowed_domain) => SetCookieScope::Subdomain { allowed_domain },
+        None => SetCookieScope::PathPrefix {
+            forced_path: &forced_path,
+        },
+    };
 
     let (resp_parts, resp_body) = upstream_resp.into_parts();
     let mut out_builder = Response::builder().status(resp_parts.status);
     if let Some(headers_mut) = out_builder.headers_mut() {
         for (name, value) in &resp_parts.headers {
             if is_hop_by_hop_header(name) {
+                continue;
+            }
+            if *name == SET_COOKIE {
+                if let Ok(raw) = value.to_str() {
+                    if let Some(sanitized) = sanitize_set_cookie_header(raw, &cookie_scope) {
+                        if let Ok(sanitized_val) = HeaderValue::from_str(&sanitized) {
+                            headers_mut.append(SET_COOKIE, sanitized_val);
+                        }
+                    }
+                }
                 continue;
             }
             headers_mut.append(name.clone(), value.clone());
@@ -1236,4 +1427,87 @@ fn audit_events_response(
         .header(CACHE_CONTROL, HeaderValue::from_static("no-store"))
         .body(body)
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_preview_subdomain_hosts_and_rejects_non_preview_hosts() {
+        assert_eq!(
+            parse_preview_subdomain_host("3000-bw-fed6f0f2a47c.localhost:7701"),
+            Some((
+                "bw-fed6f0f2a47c".into(),
+                3000,
+                "3000-bw-fed6f0f2a47c.localhost".into()
+            ))
+        );
+        assert_eq!(
+            parse_preview_subdomain_host("app.api.5173-bw-abc123.localhost:7701"),
+            Some((
+                "bw-abc123".into(),
+                5173,
+                "5173-bw-abc123.localhost".into()
+            ))
+        );
+        assert_eq!(parse_preview_subdomain_host("127.0.0.1:7701"), None);
+        assert_eq!(parse_preview_subdomain_host("localhost:7701"), None);
+        assert_eq!(parse_preview_subdomain_host("0-bw-abc123.localhost:7701"), None);
+        assert_eq!(parse_preview_subdomain_host("3000-bw-abc123.evil.com:7701"), None);
+    }
+
+    #[test]
+    fn sanitizes_set_cookie_for_subdomain_and_path_prefix_scopes() {
+        let sub_scope = SetCookieScope::Subdomain {
+            allowed_domain: "3000-bw-aaa.localhost",
+        };
+        // Strips broader Domain=localhost and Domain=127.0.0.1 (making cookie host-only)
+        assert_eq!(
+            sanitize_set_cookie_header("sid=1; Domain=localhost; Path=/; HttpOnly", &sub_scope)
+                .as_deref(),
+            Some("sid=1; Path=/; HttpOnly")
+        );
+        assert_eq!(
+            sanitize_set_cookie_header("sid=1; Domain=.localhost; Path=/", &sub_scope).as_deref(),
+            Some("sid=1; Path=/")
+        );
+        assert_eq!(
+            sanitize_set_cookie_header("sid=1; Domain=127.0.0.1; Path=/", &sub_scope).as_deref(),
+            Some("sid=1; Path=/")
+        );
+        assert_eq!(
+            sanitize_set_cookie_header("sid=1; Domain=3000-bw-bbb.localhost; Path=/", &sub_scope)
+                .as_deref(),
+            Some("sid=1; Path=/")
+        );
+        // Preserves Domain= matching or nested under this exact sandbox preview subdomain
+        assert_eq!(
+            sanitize_set_cookie_header("sid=1; Domain=3000-bw-aaa.localhost; Path=/", &sub_scope)
+                .as_deref(),
+            Some("sid=1; Domain=3000-bw-aaa.localhost; Path=/")
+        );
+        assert_eq!(
+            sanitize_set_cookie_header(
+                "sid=1; Domain=app.3000-bw-aaa.localhost; Path=/",
+                &sub_scope
+            )
+            .as_deref(),
+            Some("sid=1; Domain=app.3000-bw-aaa.localhost; Path=/")
+        );
+
+        // PathPrefix fallback strips Domain= and forces Path=/v1/sandboxes/{id}/proxy/{port}/
+        let path_scope = SetCookieScope::PathPrefix {
+            forced_path: "/v1/sandboxes/bw-aaa/proxy/3000/",
+        };
+        assert_eq!(
+            sanitize_set_cookie_header("sid=1; Domain=127.0.0.1; Path=/; HttpOnly", &path_scope)
+                .as_deref(),
+            Some("sid=1; Path=/v1/sandboxes/bw-aaa/proxy/3000/; HttpOnly")
+        );
+        assert_eq!(
+            sanitize_set_cookie_header("sid=1; HttpOnly", &path_scope).as_deref(),
+            Some("sid=1; HttpOnly; Path=/v1/sandboxes/bw-aaa/proxy/3000/")
+        );
+    }
 }

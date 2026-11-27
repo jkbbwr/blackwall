@@ -40,9 +40,11 @@ use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, RootCertStore};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use std::time::Duration;
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::time::timeout;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use zeroize::Zeroizing;
 
@@ -55,7 +57,10 @@ pub const PG_AUTH_SASL_CONTINUE: i32 = 11;
 pub const PG_AUTH_SASL_FINAL: i32 = 12;
 
 const MAX_PG_STARTUP_LEN: usize = 64 * 1024;
-const MAX_PG_MSG_LEN: usize = 64 * 1024 * 1024;
+const MAX_PG_MSG_LEN: usize = 16 * 1024 * 1024;
+const INITIAL_PG_BUF_CAP: usize = 64 * 1024;
+const PG_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_SQL_AUDIT_LEN: usize = 2048;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -137,8 +142,10 @@ impl PostgresProxyServer {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
-        // 1. Read initial startup / SSLRequest packet.
-        let initial = read_startup_packet(&mut downstream).await?;
+        // 1. Read initial startup / SSLRequest packet (with handshake timeout).
+        let initial = timeout(PG_HANDSHAKE_TIMEOUT, read_startup_packet(&mut downstream))
+            .await
+            .map_err(|_| ProxyError::Postgres("timeout waiting for downstream SSLRequest".into()))??;
         if initial.len() != 8
             || i32::from_be_bytes([initial[4], initial[5], initial[6], initial[7]])
                 != PG_SSL_REQUEST_CODE
@@ -160,13 +167,18 @@ impl PostgresProxyServer {
 
         let server_cfg = self.ca.server_config(vec![])?;
         let acceptor = TlsAcceptor::from(server_cfg);
-        let mut tls_downstream = acceptor
-            .accept(downstream)
+        let mut tls_downstream = timeout(PG_HANDSHAKE_TIMEOUT, acceptor.accept(downstream))
             .await
+            .map_err(|_| ProxyError::Tls("timeout during downstream Postgres TLS accept".into()))?
             .map_err(|e| ProxyError::Tls(format!("downstream Postgres TLS accept failed: {e}")))?;
 
         // 2. Read real StartupMessage over TLS.
-        let startup_packet = read_startup_packet(&mut tls_downstream).await?;
+        let startup_packet = timeout(
+            PG_HANDSHAKE_TIMEOUT,
+            read_startup_packet(&mut tls_downstream),
+        )
+        .await
+        .map_err(|_| ProxyError::Postgres("timeout waiting for StartupMessage".into()))??;
         if startup_packet.len() < 8 {
             return Err(ProxyError::Postgres("truncated StartupMessage".into()));
         }
@@ -232,7 +244,9 @@ impl PostgresProxyServer {
         .await?;
 
         // 5. Read PasswordMessage ('p') and validate placeholder in constant time.
-        let (msg_type, body) = read_typed_msg(&mut tls_downstream).await?;
+        let (msg_type, body) = timeout(PG_HANDSHAKE_TIMEOUT, read_typed_msg(&mut tls_downstream))
+            .await
+            .map_err(|_| ProxyError::Postgres("timeout waiting for PasswordMessage".into()))??;
         if msg_type != b'p' {
             write_error_response(
                 &mut tls_downstream,
@@ -277,8 +291,10 @@ impl PostgresProxyServer {
             ))
         })?;
 
-        // 6. Dial exact resolver-pinned upstream IP:port.
-        let mut upstream_tcp = TcpStream::connect(pinned_addr).await?;
+        // 6. Dial exact resolver-pinned upstream IP:port (with timeout).
+        let mut upstream_tcp = timeout(PG_HANDSHAKE_TIMEOUT, TcpStream::connect(pinned_addr))
+            .await
+            .map_err(|_| ProxyError::Postgres("timeout connecting to upstream Postgres".into()))??;
 
         if rule.require_upstream_tls {
             // Send SSLRequest to real Postgres.
@@ -364,8 +380,13 @@ impl PostgresProxyServer {
         upstream.write_all(startup_packet).await?;
         upstream.flush().await?;
 
-        // Execute upstream SCRAM-SHA-256 authentication handshake.
-        perform_upstream_scram_sha256(&mut upstream, &mut downstream, &real_password).await?;
+        // Execute upstream SCRAM-SHA-256 authentication handshake (with timeout).
+        timeout(
+            PG_HANDSHAKE_TIMEOUT,
+            perform_upstream_scram_sha256(&mut upstream, &mut downstream, &real_password),
+        )
+        .await
+        .map_err(|_| ProxyError::AuthFailed("timeout during upstream SCRAM-SHA-256 handshake".into()))??;
         drop(real_password);
 
         // Authenticated! Relay bidirectionally while auditing Frontend Q/P/B/E SQL frames.
@@ -610,12 +631,25 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
     mac.finalize().into_bytes().into()
 }
 
+fn sanitize_sql_audit_str(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len().min(MAX_SQL_AUDIT_LEN));
+    for ch in raw.chars() {
+        let ch = if ch.is_control() { ' ' } else { ch };
+        if out.len() + ch.len_utf8() > MAX_SQL_AUDIT_LEN {
+            out.push_str("...");
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// Extract structured SQL audit information from Frontend `'Q'`, `'P'`, `'B'`, and `'E'` frames.
 pub fn extract_sql_audit_event(msg_type: u8, body: &[u8]) -> Option<(char, String)> {
     match msg_type {
         b'Q' => {
             let sql = parse_cstr(body)?;
-            Some(('Q', sql))
+            Some(('Q', sanitize_sql_audit_str(&sql)))
         }
         b'P' => {
             let (stmt_name, rest) = split_cstr(body)?;
@@ -625,12 +659,15 @@ pub fn extract_sql_audit_event(msg_type: u8, body: &[u8]) -> Option<(char, Strin
             } else {
                 format!("{stmt_name}: {query}")
             };
-            Some(('P', desc))
+            Some(('P', sanitize_sql_audit_str(&desc)))
         }
         b'B' => {
             let (portal, rest) = split_cstr(body)?;
             let (stmt_name, _) = split_cstr(rest)?;
-            Some(('B', format!("portal={portal} stmt={stmt_name}")))
+            Some((
+                'B',
+                sanitize_sql_audit_str(&format!("portal={portal} stmt={stmt_name}")),
+            ))
         }
         b'E' => {
             let (portal, rest) = split_cstr(body)?;
@@ -639,7 +676,10 @@ pub fn extract_sql_audit_event(msg_type: u8, body: &[u8]) -> Option<(char, Strin
             } else {
                 0
             };
-            Some(('E', format!("portal={portal} max_rows={max_rows}")))
+            Some((
+                'E',
+                sanitize_sql_audit_str(&format!("portal={portal} max_rows={max_rows}")),
+            ))
         }
         _ => None,
     }
@@ -705,9 +745,19 @@ async fn read_typed_msg_opt<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Opti
             "invalid Postgres message length {len}"
         )));
     }
-    let mut body = vec![0u8; len - 4];
-    if !body.is_empty() {
-        reader.read_exact(&mut body).await?;
+    let body_len = len - 4;
+    // Read incrementally instead of upfront `vec![0u8; body_len]` so a stalled 5-byte header
+    // declaring 16 MiB cannot pre-allocate memory before transmitting payload bytes.
+    let mut body = Vec::with_capacity(body_len.min(INITIAL_PG_BUF_CAP));
+    if body_len > 0 {
+        let mut limited = reader.take(body_len as u64);
+        limited.read_to_end(&mut body).await?;
+        if body.len() != body_len {
+            return Err(ProxyError::Postgres(format!(
+                "truncated Postgres frame body: expected {body_len} bytes, got {}",
+                body.len()
+            )));
+        }
     }
     Ok(Some((msg_type, body)))
 }

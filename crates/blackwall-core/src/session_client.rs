@@ -31,6 +31,12 @@ use uuid::Uuid;
 /// `CtrlRequest` uses JSON encoding where a `Vec<u8>` expands up to 4x (`255,`),
 /// so 64 KiB raw bytes stay safely under `blackwall_proto::MAX_CTRL_FRAME` (1 MiB).
 const MAX_RAW_CHUNK_BYTES: usize = 64 * 1024;
+/// Maximum bytes buffered per stream (`stdout` / `stderr`) in `exec_sync` to prevent guest OOM attacks on the host daemon.
+pub const MAX_EXEC_SYNC_STREAM_BYTES: usize = 16 * 1024 * 1024;
+const EXEC_TRUNCATION_MARKER: &[u8] = b"\n[blackwall: output truncated at 16 MiB]\n";
+/// Bounded per-session queue depth for PTY output and TCP tunnel data frames.
+const PTY_CHANNEL_CAPACITY: usize = 256;
+const TCP_TUNNEL_CHANNEL_CAPACITY: usize = 256;
 
 /// Guest boot readiness confirmation returned by [`SessionClient::boot_configure`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -274,7 +280,7 @@ impl PtyWriter {
 /// Bidirectional interactive PTY handle bridging Port 1002 to WebSockets or local terminals.
 pub struct PtyHandle {
     writer: PtyWriter,
-    output_rx: mpsc::UnboundedReceiver<PtyEvent>,
+    output_rx: mpsc::Receiver<PtyEvent>,
 }
 
 impl PtyHandle {
@@ -299,7 +305,7 @@ impl PtyHandle {
     }
 
     /// Split into independent write/control and output-stream halves (ideal for WebSocket tasks).
-    pub fn split(self) -> (PtyWriter, mpsc::UnboundedReceiver<PtyEvent>) {
+    pub fn split(self) -> (PtyWriter, mpsc::Receiver<PtyEvent>) {
         (self.writer, self.output_rx)
     }
 }
@@ -405,7 +411,7 @@ impl TcpTunnelWriter {
 /// Bidirectional host-to-guest TCP ingress tunnel handle over Port 1002.
 pub struct TcpTunnelHandle {
     writer: TcpTunnelWriter,
-    rx: mpsc::UnboundedReceiver<TcpTunnelEvent>,
+    rx: mpsc::Receiver<TcpTunnelEvent>,
 }
 
 impl TcpTunnelHandle {
@@ -430,7 +436,7 @@ impl TcpTunnelHandle {
     }
 
     /// Split into independent write/control and receive-stream halves.
-    pub fn split(self) -> (TcpTunnelWriter, mpsc::UnboundedReceiver<TcpTunnelEvent>) {
+    pub fn split(self) -> (TcpTunnelWriter, mpsc::Receiver<TcpTunnelEvent>) {
         (self.writer, self.rx)
     }
 
@@ -443,7 +449,7 @@ impl TcpTunnelHandle {
 /// Tokio [`AsyncRead`] + [`AsyncWrite`] adapter over a [`TcpTunnelHandle`].
 pub struct TcpTunnelStream {
     writer: TcpTunnelWriter,
-    rx: mpsc::UnboundedReceiver<TcpTunnelEvent>,
+    rx: mpsc::Receiver<TcpTunnelEvent>,
     read_buf: Vec<u8>,
     read_pos: usize,
     eof: bool,
@@ -592,7 +598,7 @@ fn unix_now_ms() -> u64 {
 }
 
 struct RegisteredTcpTunnel {
-    tx: mpsc::UnboundedSender<TcpTunnelEvent>,
+    tx: mpsc::Sender<TcpTunnelEvent>,
     bytes_out: Arc<AtomicU64>,
 }
 
@@ -601,9 +607,9 @@ struct SessionInner {
     writer: Mutex<UnixStream>,
     next_req_id: AtomicU64,
     pending_reqs: Mutex<HashMap<u64, mpsc::UnboundedSender<CtrlResponse>>>,
-    pty_sessions: Mutex<HashMap<String, mpsc::UnboundedSender<PtyEvent>>>,
+    pty_sessions: Mutex<HashMap<String, mpsc::Sender<PtyEvent>>>,
     tcp_tunnels: Mutex<HashMap<String, RegisteredTcpTunnel>>,
-    host_bridge_open_tx: Mutex<Option<mpsc::UnboundedSender<(String, u16)>>>,
+    host_bridge_open_tx: Mutex<Option<mpsc::Sender<(String, u16)>>>,
     closed: AtomicBool,
 }
 
@@ -642,13 +648,13 @@ impl SessionInner {
         }
     }
 
-    fn register_pty(&self, session_id: String) -> Result<mpsc::UnboundedReceiver<PtyEvent>> {
+    fn register_pty(&self, session_id: String) -> Result<mpsc::Receiver<PtyEvent>> {
         if self.is_closed() {
             return Err(CoreError::SessionClosed(
                 "Port 1002 transport already closed".into(),
             ));
         }
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(PTY_CHANNEL_CAPACITY);
         let mut guard = self
             .pty_sessions
             .lock()
@@ -667,13 +673,13 @@ impl SessionInner {
         &self,
         stream_id: String,
         bytes_out: Arc<AtomicU64>,
-    ) -> Result<mpsc::UnboundedReceiver<TcpTunnelEvent>> {
+    ) -> Result<mpsc::Receiver<TcpTunnelEvent>> {
         if self.is_closed() {
             return Err(CoreError::SessionClosed(
                 "Port 1002 transport already closed".into(),
             ));
         }
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(TCP_TUNNEL_CHANNEL_CAPACITY);
         let mut guard = self
             .tcp_tunnels
             .lock()
@@ -682,6 +688,12 @@ impl SessionInner {
             return Err(CoreError::SessionClosed(
                 "Port 1002 transport already closed".into(),
             ));
+        }
+        // Reject stream_id collisions so a guest cannot overwrite an existing active ingress tunnel.
+        if guard.contains_key(&stream_id) {
+            return Err(CoreError::InvalidRequest(format!(
+                "duplicate active TCP tunnel stream_id '{stream_id}'"
+            )));
         }
         guard.insert(stream_id, RegisteredTcpTunnel { tx, bytes_out });
         Ok(rx)
@@ -769,8 +781,8 @@ impl SessionClient {
         self.inner.is_closed()
     }
 
-    /// Register a channel to receive guest-initiated `CtrlResponse::HostBridgeOpen` frames.
-    pub fn set_host_bridge_open_tx(&self, tx: mpsc::UnboundedSender<(String, u16)>) {
+    /// Register a bounded channel to receive guest-initiated `CtrlResponse::HostBridgeOpen` frames.
+    pub fn set_host_bridge_open_tx(&self, tx: mpsc::Sender<(String, u16)>) {
         if let Ok(mut guard) = self.inner.host_bridge_open_tx.lock() {
             *guard = Some(tx);
         }
@@ -819,19 +831,45 @@ impl SessionClient {
         let mut rx = self.exec_stream(req).await?;
         let mut stdout_bytes = Vec::new();
         let mut stderr_bytes = Vec::new();
+        let mut stdout_bytes_len: usize = 0;
+        let mut stderr_bytes_len: usize = 0;
+        let mut stdout_truncated = false;
+        let mut stderr_truncated = false;
 
         while let Some(ev) = rx.recv().await {
             match ev {
-                ExecStreamEvent::Stdout(chunk) => stdout_bytes.extend_from_slice(&chunk),
-                ExecStreamEvent::Stderr(chunk) => stderr_bytes.extend_from_slice(&chunk),
+                ExecStreamEvent::Stdout(chunk) => {
+                    stdout_bytes_len = stdout_bytes_len.saturating_add(chunk.len());
+                    if !stdout_truncated {
+                        let remaining = MAX_EXEC_SYNC_STREAM_BYTES.saturating_sub(stdout_bytes.len());
+                        if chunk.len() <= remaining {
+                            stdout_bytes.extend_from_slice(&chunk);
+                        } else {
+                            stdout_bytes.extend_from_slice(&chunk[..remaining]);
+                            stdout_bytes.extend_from_slice(EXEC_TRUNCATION_MARKER);
+                            stdout_truncated = true;
+                        }
+                    }
+                }
+                ExecStreamEvent::Stderr(chunk) => {
+                    stderr_bytes_len = stderr_bytes_len.saturating_add(chunk.len());
+                    if !stderr_truncated {
+                        let remaining = MAX_EXEC_SYNC_STREAM_BYTES.saturating_sub(stderr_bytes.len());
+                        if chunk.len() <= remaining {
+                            stderr_bytes.extend_from_slice(&chunk);
+                        } else {
+                            stderr_bytes.extend_from_slice(&chunk[..remaining]);
+                            stderr_bytes.extend_from_slice(EXEC_TRUNCATION_MARKER);
+                            stderr_truncated = true;
+                        }
+                    }
+                }
                 ExecStreamEvent::Exit {
                     exit_code,
                     timed_out,
                     duration_ms,
                 } => {
                     let finished_at_ms = unix_now_ms();
-                    let stdout_bytes_len = stdout_bytes.len();
-                    let stderr_bytes_len = stderr_bytes.len();
                     let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
                     let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
                     return Ok(ExecResult {
@@ -1238,42 +1276,25 @@ impl SessionClient {
         expect_ack(&mut rx, "HostBridgeUnbind").await
     }
 
-    /// Accept or reject a guest-initiated `CtrlResponse::HostBridgeOpen` stream.
+    /// Accept a guest-initiated `CtrlResponse::HostBridgeOpen` stream.
     ///
-    /// When `ok == true`, registers `stream_id` in the active TCP tunnel map BEFORE sending
-    /// `CtrlRequest::HostBridgeAccepted { ok: true }` so no early guest `TcpData` frames are lost.
-    pub async fn register_host_bridge_stream(
-        &self,
-        stream_id: String,
-        ok: bool,
-        reason: Option<String>,
-    ) -> Result<Option<TcpTunnelHandle>> {
-        if !ok {
-            self.inner.send_request(&CtrlRequest::HostBridgeAccepted {
-                stream_id,
-                ok: false,
-                reason,
-            })?;
-            return Ok(None);
-        }
-
+    /// Registers `stream_id` in the active TCP tunnel map (rejecting collisions) BEFORE sending
+    /// `CtrlRequest::HostBridgeAccepted` so no early guest `TcpData` frames are lost.
+    pub async fn accept_host_bridge_stream(&self, stream_id: String) -> Result<TcpTunnelHandle> {
         let bytes_in = Arc::new(AtomicU64::new(0));
         let bytes_out = Arc::new(AtomicU64::new(0));
-        // Register BEFORE sending HostBridgeAccepted so early frames are never dropped.
         let tunnel_rx = self
             .inner
             .register_tcp_tunnel(stream_id.clone(), Arc::clone(&bytes_out))?;
 
         if let Err(err) = self.inner.send_request(&CtrlRequest::HostBridgeAccepted {
             stream_id: stream_id.clone(),
-            ok: true,
-            reason: None,
         }) {
             self.inner.remove_tcp_tunnel(&stream_id);
             return Err(err);
         }
 
-        Ok(Some(TcpTunnelHandle {
+        Ok(TcpTunnelHandle {
             writer: TcpTunnelWriter {
                 state: Arc::new(TunnelCloseState {
                     stream_id,
@@ -1286,7 +1307,19 @@ impl SessionClient {
                 }),
             },
             rx: tunnel_rx,
-        }))
+        })
+    }
+
+    /// Reject a guest-initiated `CtrlResponse::HostBridgeOpen` stream.
+    pub async fn reject_host_bridge_stream(
+        &self,
+        stream_id: String,
+        reason: impl Into<String>,
+    ) -> Result<()> {
+        self.inner.send_request(&CtrlRequest::HostBridgeRejected {
+            stream_id,
+            reason: reason.into(),
+        })
     }
 
     /// Upload a raw file or tar/tar.gz archive into `/workspace` over Port 1002.
@@ -1619,7 +1652,7 @@ fn dispatch_response(inner: &SessionInner, resp: CtrlResponse) {
                 .ok()
                 .and_then(|g| g.get(session_id).cloned());
             if let Some(tx) = tx {
-                let _ = tx.send(PtyEvent::Output(data.clone()));
+                let _ = tx.try_send(PtyEvent::Output(data.clone()));
             }
         }
         CtrlResponse::PtyExited {
@@ -1632,7 +1665,7 @@ fn dispatch_response(inner: &SessionInner, resp: CtrlResponse) {
                 .ok()
                 .and_then(|mut g| g.remove(session_id));
             if let Some(tx) = tx {
-                let _ = tx.send(PtyEvent::Exited(*exit_code));
+                let _ = tx.try_send(PtyEvent::Exited(*exit_code));
             }
         }
         CtrlResponse::TcpData { stream_id, data } => {
@@ -1643,7 +1676,13 @@ fn dispatch_response(inner: &SessionInner, resp: CtrlResponse) {
                 .and_then(|g| g.get(stream_id).map(|t| (t.tx.clone(), Arc::clone(&t.bytes_out))));
             if let Some((tx, bytes_out)) = target {
                 bytes_out.fetch_add(data.len() as u64, Ordering::Relaxed);
-                let _ = tx.send(TcpTunnelEvent::Data(data.clone()));
+                if tx.try_send(TcpTunnelEvent::Data(data.clone())).is_err() {
+                    // Consumer is stalled or gone — drop the tunnel cleanly instead of blocking Port 1002.
+                    inner.remove_tcp_tunnel(stream_id);
+                    let _ = inner.send_request(&CtrlRequest::TcpClose {
+                        stream_id: stream_id.clone(),
+                    });
+                }
             }
         }
         CtrlResponse::TcpClosed { stream_id, reason } => {
@@ -1653,7 +1692,7 @@ fn dispatch_response(inner: &SessionInner, resp: CtrlResponse) {
                 .ok()
                 .and_then(|mut g| g.remove(stream_id));
             if let Some(t) = target {
-                let _ = t.tx.send(TcpTunnelEvent::Closed(reason.clone()));
+                let _ = t.tx.try_send(TcpTunnelEvent::Closed(reason.clone()));
             }
         }
         CtrlResponse::HostBridgeOpen {
@@ -1666,7 +1705,17 @@ fn dispatch_response(inner: &SessionInner, resp: CtrlResponse) {
                 .ok()
                 .and_then(|g| g.clone());
             if let Some(tx) = tx {
-                let _ = tx.send((stream_id.clone(), *guest_port));
+                if tx.try_send((stream_id.clone(), *guest_port)).is_err() {
+                    let _ = inner.send_request(&CtrlRequest::HostBridgeRejected {
+                        stream_id: stream_id.clone(),
+                        reason: "host bridge acceptor queue full".into(),
+                    });
+                }
+            } else {
+                let _ = inner.send_request(&CtrlRequest::HostBridgeRejected {
+                    stream_id: stream_id.clone(),
+                    reason: "host bridges unavailable".into(),
+                });
             }
         }
         _ => {

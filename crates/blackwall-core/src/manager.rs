@@ -1097,7 +1097,8 @@ impl SandboxManager {
 
         let bridges: Arc<Mutex<BTreeMap<u16, HostServiceSpec>>> =
             Arc::new(Mutex::new(BTreeMap::new()));
-        let (bridge_open_tx, bridge_open_rx) = mpsc::unbounded_channel::<(String, u16)>();
+        let (bridge_open_tx, bridge_open_rx) =
+            mpsc::channel::<(String, u16)>(HOST_BRIDGE_OPEN_QUEUE_CAPACITY);
         session.set_host_bridge_open_tx(bridge_open_tx);
         let bridge_task = spawn_host_bridge_acceptor(
             sandbox_id.clone(),
@@ -2065,20 +2066,52 @@ impl SandboxManager {
     }
 }
 
+const HOST_BRIDGE_OPEN_QUEUE_CAPACITY: usize = 64;
+const MAX_CONCURRENT_HOST_BRIDGE_STREAMS: usize = 64;
+
 fn spawn_host_bridge_acceptor(
     sandbox_id: String,
     session: SessionClient,
     bridges: Arc<Mutex<BTreeMap<u16, HostServiceSpec>>>,
     audit_sink: Arc<dyn AuditSink>,
-    mut rx: mpsc::UnboundedReceiver<(String, u16)>,
+    mut rx: mpsc::Receiver<(String, u16)>,
 ) -> tokio::task::JoinHandle<()> {
+    let concurrency_limit = Arc::new(tokio::sync::Semaphore::new(
+        MAX_CONCURRENT_HOST_BRIDGE_STREAMS,
+    ));
     tokio::spawn(async move {
         while let Some((stream_id, guest_port)) = rx.recv().await {
+            let Ok(permit) = Arc::clone(&concurrency_limit).try_acquire_owned() else {
+                let _ = session
+                    .reject_host_bridge_stream(
+                        stream_id,
+                        format!(
+                            "too many concurrent host bridge streams (limit={MAX_CONCURRENT_HOST_BRIDGE_STREAMS})"
+                        ),
+                    )
+                    .await;
+                audit_sink.record(
+                    AuditEvent::now(
+                        &sandbox_id,
+                        AuditEventKind::HostServiceBridge {
+                            name: "rate_limited".to_string(),
+                            guest_port,
+                            target: String::new(),
+                            bytes_in: 0,
+                            bytes_out: 0,
+                            allowed: false,
+                        },
+                    )
+                    .with_origin(AuditOrigin::Daemon),
+                );
+                continue;
+            };
             let sid = sandbox_id.clone();
             let sess = session.clone();
             let bridges_ref = Arc::clone(&bridges);
             let sink = Arc::clone(&audit_sink);
             tokio::spawn(async move {
+                let _permit = permit;
                 handle_host_bridge_open(sid, sess, bridges_ref, sink, stream_id, guest_port).await;
             });
         }
@@ -2100,11 +2133,7 @@ async fn handle_host_bridge_open(
 
     let Some(svc) = svc_opt else {
         let _ = session
-            .register_host_bridge_stream(
-                stream_id,
-                false,
-                Some("guest port not bridged".to_string()),
-            )
+            .reject_host_bridge_stream(stream_id, "guest port not bridged")
             .await;
         audit_sink.record(
             AuditEvent::now(
@@ -2128,7 +2157,7 @@ async fn handle_host_bridge_open(
             Ok(s) => s,
             Err(err) => {
                 let _ = session
-                    .register_host_bridge_stream(stream_id, false, Some(err.to_string()))
+                    .reject_host_bridge_stream(stream_id, err.to_string())
                     .await;
                 audit_sink.record(
                     AuditEvent::now(
@@ -2148,12 +2177,14 @@ async fn handle_host_bridge_open(
             }
         };
 
-        let tunnel = match session
-            .register_host_bridge_stream(stream_id, true, None)
-            .await
-        {
-            Ok(Some(t)) => t,
-            Ok(None) | Err(_) => return,
+        let tunnel = match session.accept_host_bridge_stream(stream_id.clone()).await {
+            Ok(t) => t,
+            Err(err) => {
+                let _ = session
+                    .reject_host_bridge_stream(stream_id, err.to_string())
+                    .await;
+                return;
+            }
         };
         let mut guest_stream = tunnel.into_stream();
         let (bytes_in, bytes_out) =
@@ -2180,7 +2211,7 @@ async fn handle_host_bridge_open(
             Ok(s) => s,
             Err(err) => {
                 let _ = session
-                    .register_host_bridge_stream(stream_id, false, Some(err.to_string()))
+                    .reject_host_bridge_stream(stream_id, err.to_string())
                     .await;
                 audit_sink.record(
                     AuditEvent::now(
@@ -2200,12 +2231,14 @@ async fn handle_host_bridge_open(
             }
         };
 
-        let tunnel = match session
-            .register_host_bridge_stream(stream_id, true, None)
-            .await
-        {
-            Ok(Some(t)) => t,
-            Ok(None) | Err(_) => return,
+        let tunnel = match session.accept_host_bridge_stream(stream_id.clone()).await {
+            Ok(t) => t,
+            Err(err) => {
+                let _ = session
+                    .reject_host_bridge_stream(stream_id, err.to_string())
+                    .await;
+                return;
+            }
         };
         let mut guest_stream = tunnel.into_stream();
         let (bytes_in, bytes_out) =
