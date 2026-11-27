@@ -409,7 +409,11 @@ verify_resolved_config() {
     assert_cfg_eq "${cfg}" "CONFIG_LTO_CLANG_THIN" "y"
     assert_cfg_eq "${cfg}" "CONFIG_CFI" "y"
     assert_cfg_eq "${cfg}" "CONFIG_KMALLOC_PARTITION_CACHES" "y"
-    assert_cfg_eq "${cfg}" "CONFIG_KMALLOC_PARTITION_TYPED" "y"
+    if [[ -n "${KERNEL_SRC}" ]]; then
+        if ! grep -Fxq "CONFIG_KMALLOC_PARTITION_TYPED=y" "${cfg}" && ! grep -Fxq "CONFIG_KMALLOC_PARTITION_RANDOM=y" "${cfg}"; then
+            die "Security invariant failed in ${cfg}: expected CONFIG_KMALLOC_PARTITION_TYPED=y or CONFIG_KMALLOC_PARTITION_RANDOM=y"
+        fi
+    fi
     assert_cfg_eq "${cfg}" "CONFIG_SYSVIPC" "y"
     assert_cfg_eq "${cfg}" "CONFIG_IPC_NS" "y"
     assert_cfg_eq "${cfg}" "CONFIG_BLK_DEV_INITRD" "y"

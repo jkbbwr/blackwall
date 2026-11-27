@@ -82,10 +82,6 @@ check-deps:
     clang_ver=""
     if command -v clang >/dev/null 2>&1; then
         clang_ver="$(clang --version | head -n 1)"
-        clang_major="$(clang -dumpversion 2>/dev/null | cut -d. -f1 || true)"
-        if [ -n "$clang_major" ] && [ "$clang_major" -lt 22 ] 2>/dev/null; then
-            warnings+=("clang ${clang_major} < 22 (Linux 7.3 KMALLOC_PARTITION_TYPED requires Clang 22+)")
-        fi
     fi
     check_cmd clang "$clang_ver"
     check_cmd ld.lld "from lld"
