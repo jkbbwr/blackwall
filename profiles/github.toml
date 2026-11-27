@@ -41,10 +41,16 @@ host = "github.com"
 methods = ["GET", "HEAD", "POST"]
 path_prefixes = ["/"]
 
-# GitHub REST + GraphQL API (`gh` uses POST /graphql even for reads)
+# GitHub REST + GraphQL API (`gh` uses POST /graphql even for reads, DELETE for releases/branches)
 [[network.http]]
 host = "api.github.com"
-methods = ["GET", "HEAD", "POST", "PUT", "PATCH"]
+methods = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]
+path_prefixes = ["/"]
+
+# Release asset uploads (`gh release upload` / `gh release create`)
+[[network.http]]
+host = "uploads.github.com"
+methods = ["GET", "HEAD", "POST", "PUT"]
 path_prefixes = ["/"]
 
 [[network.http]]
@@ -52,8 +58,14 @@ host = "raw.githubusercontent.com"
 methods = ["GET", "HEAD"]
 path_prefixes = ["/"]
 
+# Release assets & Git LFS object transfers (`PUT` for `git lfs push`)
 [[network.http]]
 host = "objects.githubusercontent.com"
+methods = ["GET", "HEAD", "PUT"]
+path_prefixes = ["/"]
+
+[[network.http]]
+host = "release-assets.githubusercontent.com"
 methods = ["GET", "HEAD"]
 path_prefixes = ["/"]
 
