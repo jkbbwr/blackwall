@@ -1,0 +1,37 @@
+version = 1
+name = "cpp-dev"
+extends = ["base"]
+
+[image]
+base = "debian:bookworm-slim"
+packages = [
+  "ca-certificates",
+  "git",
+  "ripgrep",
+  "jq",
+  "build-essential",
+  "clang",
+  "lld",
+  "cmake",
+  "ninja-build",
+  "pkg-config",
+  "gdb",
+]
+run = [
+  "mkdir -p /workspace /home/sandbox && useradd -m -u 1000 -s /bin/bash sandbox 2>/dev/null || true && chown -R 1000:1000 /workspace /home/sandbox",
+]
+
+[compute]
+vcpus = 4
+memory_mib = 4096
+workspace_mib = 4096
+idle_timeout_sec = 900
+max_wall_time_sec = 7200
+
+[ingress]
+allow_ports = [8080]
+
+[env]
+CC = "clang"
+CXX = "clang++"
+CMAKE_GENERATOR = "Ninja"

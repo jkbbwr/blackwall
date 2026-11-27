@@ -1,0 +1,14 @@
+# Blackwall — Loopback + TUN Network Profile Fragment (vmlinux-lo)
+# Primary default kernel for `loopback` and `egress` modes:
+# native 127.0.0.1/::1 loopback + in-guest tun0 for blackwall-netbridge (smoltcp -> vsock).
+
+CONFIG_INET=y
+CONFIG_IPV6=y
+CONFIG_NETDEVICES=y
+CONFIG_NET_CORE=y
+CONFIG_TUN=y
+
+# Zero physical/virtual NIC drivers (no virtio-net, no e1000, no veth, no bridge)
+# CONFIG_ETHERNET is not set
+# CONFIG_VETH is not set
+# CONFIG_BRIDGE is not set

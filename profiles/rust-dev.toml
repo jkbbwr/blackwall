@@ -1,0 +1,58 @@
+version = 1
+name = "rust-dev"
+extends = ["base"]
+
+[image]
+base = "debian:bookworm-slim"
+packages = [
+  "ca-certificates",
+  "git",
+  "curl",
+  "ripgrep",
+  "jq",
+  "build-essential",
+  "pkg-config",
+  "libssl-dev",
+  "clang",
+  "lld",
+]
+run = [
+  "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | env RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo sh -s -- -y --profile default --default-toolchain stable --no-modify-path",
+  "chmod -R a+rX /usr/local/rustup /usr/local/cargo && ln -sf /usr/local/cargo/bin/* /usr/local/bin/",
+  "mkdir -p /workspace /home/sandbox && useradd -m -u 1000 -s /bin/bash sandbox 2>/dev/null || true && chown -R 1000:1000 /workspace /home/sandbox",
+]
+
+[compute]
+vcpus = 4
+memory_mib = 4096
+workspace_mib = 6144
+idle_timeout_sec = 900
+max_wall_time_sec = 7200
+
+[network]
+mode = "egress"
+
+[[network.http]]
+host = "index.crates.io"
+methods = ["GET", "HEAD"]
+path_prefixes = ["/"]
+
+[[network.http]]
+host = "static.crates.io"
+methods = ["GET", "HEAD"]
+path_prefixes = ["/"]
+
+[[network.http]]
+host = "crates.io"
+methods = ["GET", "HEAD"]
+path_prefixes = ["/api/v1/crates/"]
+
+[ingress]
+allow_ports = [3000, 8000, 8080]
+
+[env]
+RUSTUP_HOME = "/usr/local/rustup"
+CARGO_HOME = "/workspace/.cargo"
+CARGO_TARGET_DIR = "/workspace/target"
+CARGO_HTTP_CAINFO = "/etc/ssl/certs/ca-certificates.crt"
+RUST_BACKTRACE = "1"

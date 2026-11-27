@@ -1,0 +1,20 @@
+# Blackwall — aarch64 Architecture Fragment (ARM64 KVM & Apple Silicon HVF, Linux 6.12+)
+
+# Hardware Pointer Authentication, Branch Target Identification, Shadow Call Stack & KPTI
+CONFIG_ARM64_PTR_AUTH=y
+CONFIG_ARM64_PTR_AUTH_KERNEL=y
+CONFIG_ARM64_BTI=y
+CONFIG_ARM64_BTI_KERNEL=y
+CONFIG_SHADOW_CALL_STACK=y
+CONFIG_UNMAP_KERNEL_AT_EL0=y
+CONFIG_RODATA_FULL_DEFAULT_ENABLED=y
+
+# Hardware-accelerated ARMv8 Crypto Extensions for dm-crypt
+CONFIG_CRYPTO_AES_ARM64_CE_BLK=y
+
+# Pure AArch64 EL0 only (disable 32-bit compat syscalls)
+# CONFIG_COMPAT is not set
+
+# Forced built-in kernel command line (prevents runtime cmdline injection)
+CONFIG_CMDLINE_FORCE=y
+CONFIG_CMDLINE="console=hvc0 lockdown=confidentiality lsm=lockdown,yama,landlock slab_nomerge init_on_alloc=1 init_on_free=1 page_alloc.shuffle=1 randomize_kstack_offset=on vsyscall=none debugfs=off oops=panic panic=-1 mitigations=auto,nosmt random.trust_cpu=on random.trust_bootloader=off"

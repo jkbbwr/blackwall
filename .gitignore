@@ -1,0 +1,17 @@
+/target/
+/dist/
+/ui/node_modules/
+/ui/dist/
+/kernel/build/
+/kernel/src/
+/kernel/out/
+*.vmlinux
+*.erofs
+*.verity
+*.key
+*.token
+.env
+.env.*
+.blackwall/
+*.sock
+.DS_Store

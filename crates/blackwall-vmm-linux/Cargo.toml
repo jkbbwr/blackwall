@@ -1,0 +1,16 @@
+[package]
+name = "blackwall-vmm-linux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+blackwall-vmm.workspace = true
+blackwall-audit.workspace = true
+libc.workspace = true
+tracing.workspace = true
+landlock = "0.4"
+seccompiler = "0.5"
+
+[dev-dependencies]
+tempfile.workspace = true

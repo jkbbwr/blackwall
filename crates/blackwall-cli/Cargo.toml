@@ -1,0 +1,43 @@
+[package]
+name = "blackwall-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "blackwall"
+path = "src/main.rs"
+
+[dependencies]
+blackwall-audit.workspace = true
+blackwall-core.workspace = true
+blackwall-oci.workspace = true
+blackwall-policy.workspace = true
+blackwall-proto.workspace = true
+blackwall-secrets.workspace = true
+blackwall-unpacker.workspace = true
+
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+libc.workspace = true
+percent-encoding = "2"
+serde.workspace = true
+serde_json.workspace = true
+tar.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+flate2.workspace = true
+hyper = { version = "1", features = ["client", "server", "http1"] }
+tempfile.workspace = true

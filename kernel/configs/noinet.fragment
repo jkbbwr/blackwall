@@ -1,0 +1,8 @@
+# Blackwall — Strict Offline Network Profile Fragment (vmlinux-noinet)
+# Entire TCP/IP & TUN stack physically compiled out (socket(AF_INET, ...) -> EAFNOSUPPORT).
+# Retains AF_UNIX and AF_VSOCK from common-hardened.config.
+
+# CONFIG_INET is not set
+# CONFIG_IPV6 is not set
+# CONFIG_NETDEVICES is not set
+# CONFIG_TUN is not set

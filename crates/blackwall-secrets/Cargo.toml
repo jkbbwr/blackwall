@@ -1,0 +1,21 @@
+[package]
+name = "blackwall-secrets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+base64.workspace = true
+blackwall-policy.workspace = true
+hex.workspace = true
+hpke = { version = "0.15", default-features = false, features = ["alloc", "getrandom", "x25519", "chacha"] }
+libc.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+subtle = "2"
+thiserror.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,59 @@
+version = 1
+name = "py-dev"
+extends = ["base"]
+
+[image]
+base = "debian:bookworm-slim"
+packages = [
+  "ca-certificates",
+  "git",
+  "curl",
+  "ripgrep",
+  "jq",
+  "build-essential",
+  "pkg-config",
+  "libssl-dev",
+  "libffi-dev",
+  "python3",
+  "python3-venv",
+  "python3-pip",
+]
+run = [
+  "curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh",
+  "uv tool install --tool-dir /usr/local/share/uv-tools --bin-dir /usr/local/bin ruff",
+  "uv tool install --tool-dir /usr/local/share/uv-tools --bin-dir /usr/local/bin pytest",
+  "uv tool install --tool-dir /usr/local/share/uv-tools --bin-dir /usr/local/bin mypy",
+  "mkdir -p /workspace /home/sandbox && useradd -m -u 1000 -s /bin/bash sandbox 2>/dev/null || true && chown -R 1000:1000 /workspace /home/sandbox",
+]
+
+[compute]
+vcpus = 4
+memory_mib = 4096
+workspace_mib = 4096
+idle_timeout_sec = 900
+max_wall_time_sec = 7200
+
+[network]
+mode = "egress"
+
+[[network.http]]
+host = "pypi.org"
+methods = ["GET", "HEAD"]
+path_prefixes = ["/"]
+
+[[network.http]]
+host = "files.pythonhosted.org"
+methods = ["GET", "HEAD"]
+path_prefixes = ["/"]
+
+[ingress]
+allow_ports = [5000, 8000, 8080]
+
+[env]
+PYTHONDONTWRITEBYTECODE = "1"
+PYTHONUNBUFFERED = "1"
+REQUESTS_CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
+UV_NATIVE_TLS = "true"
+UV_CACHE_DIR = "/workspace/.uv-cache"
+PIP_CACHE_DIR = "/workspace/.pip-cache"
+VIRTUAL_ENV = "/workspace/.venv"

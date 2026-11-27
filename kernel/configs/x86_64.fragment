@@ -1,0 +1,32 @@
+# Blackwall — x86_64 Architecture Fragment (Linux KVM / Cloud Hypervisor, Linux 6.12+)
+
+# Virtio PCI transport + PVH direct vmlinux boot + pvpanic for Cloud Hypervisor on x86_64
+CONFIG_PCI=y
+CONFIG_VIRTIO_PCI=y
+CONFIG_HYPERVISOR_GUEST=y
+CONFIG_PARAVIRT=y
+CONFIG_KVM_GUEST=y
+CONFIG_PVH=y
+CONFIG_PVPANIC=y
+CONFIG_PVPANIC_MMIO=y
+CONFIG_PVPANIC_PCI=y
+
+# Hardware CFI & CPU speculation mitigations (6.9+ CONFIG_MITIGATION_* naming)
+CONFIG_X86_KERNEL_IBT=y
+CONFIG_MITIGATION_PAGE_TABLE_ISOLATION=y
+CONFIG_MITIGATION_RETPOLINE=y
+CONFIG_MITIGATION_SLS=y
+
+# Hardware-accelerated AES-NI for dm-crypt
+CONFIG_CRYPTO_AES_NI_INTEL=y
+
+# Pure 64-bit syscall surface only (disable 32-bit emulation, LDT, and vsyscall)
+# CONFIG_IA32_EMULATION is not set
+# CONFIG_MODIFY_LDT_SYSCALL is not set
+# CONFIG_X86_VSYSCALL_EMULATION is not set
+CONFIG_LEGACY_VSYSCALL_NONE=y
+
+# Forced built-in kernel command line (prevents runtime cmdline injection)
+CONFIG_CMDLINE_BOOL=y
+CONFIG_CMDLINE_OVERRIDE=y
+CONFIG_CMDLINE="console=hvc0 lockdown=confidentiality lsm=lockdown,yama,landlock slab_nomerge init_on_alloc=1 init_on_free=1 page_alloc.shuffle=1 randomize_kstack_offset=on vsyscall=none debugfs=off oops=panic panic=-1 mitigations=auto,nosmt random.trust_cpu=on random.trust_bootloader=off"

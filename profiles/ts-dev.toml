@@ -1,0 +1,50 @@
+version = 1
+name = "ts-dev"
+extends = ["base"]
+
+[image]
+base = "debian:bookworm-slim"
+packages = [
+  "ca-certificates",
+  "git",
+  "curl",
+  "ripgrep",
+  "jq",
+  "unzip",
+  "xz-utils",
+  "build-essential",
+  "python3",
+]
+run = [
+  "curl -fsSL https://nodejs.org/dist/v22.14.0/node-v22.14.0-linux-x64.tar.xz | tar -xJ --strip-components=1 -C /usr/local",
+  "npm install -g pnpm@10 typescript tsx eslint prettier",
+  "curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local bash",
+  "mkdir -p /workspace /home/sandbox && useradd -m -u 1000 -s /bin/bash sandbox 2>/dev/null || true && chown -R 1000:1000 /workspace /home/sandbox",
+]
+
+[compute]
+vcpus = 4
+memory_mib = 4096
+workspace_mib = 4096
+idle_timeout_sec = 900
+max_wall_time_sec = 7200
+
+[network]
+mode = "egress"
+
+[[network.http]]
+host = "registry.npmjs.org"
+methods = ["GET", "HEAD"]
+path_prefixes = ["/"]
+
+[ingress]
+allow_ports = [3000, 5173, 8080, 8787]
+
+[env]
+NODE_ENV = "development"
+HOME = "/home/sandbox"
+NODE_EXTRA_CA_CERTS = "/run/blackwall/mitm-ca.crt"
+SSL_CERT_FILE = "/etc/ssl/certs/ca-certificates.crt"
+npm_config_cache = "/workspace/.npm-cache"
+PNPM_STORE_DIR = "/workspace/.pnpm-store"
+BUN_INSTALL_CACHE_DIR = "/workspace/.bun-cache"

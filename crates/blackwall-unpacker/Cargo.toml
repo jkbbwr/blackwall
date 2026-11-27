@@ -1,0 +1,23 @@
+[package]
+name = "blackwall-unpacker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+blackwall-audit.workspace = true
+blackwall-policy.workspace = true
+blackwall-proto.workspace = true
+flate2.workspace = true
+globset = "0.4"
+libc.workspace = true
+tar.workspace = true
+thiserror.workspace = true
+unicode-normalization = "0.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+seccompiler = "0.5"
+
+[dev-dependencies]
+tempfile.workspace = true

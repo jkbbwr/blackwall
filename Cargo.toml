@@ -1,0 +1,62 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/blackwall-proto",
+    "crates/blackwall-audit",
+    "crates/blackwall-policy",
+    "crates/blackwall-secrets",
+    "crates/blackwall-oci",
+    "crates/blackwall-unpacker",
+    "crates/blackwall-vmm",
+    "crates/blackwall-vmm-linux",
+    "crates/blackwall-proxy",
+    "crates/blackwall-core",
+    "crates/blackwall-daemon",
+    "crates/blackwall-cli",
+    "guest/blackwall-init",
+    "guest/blackwall-netbridge",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+
+[workspace.dependencies]
+blackwall-proto = { path = "crates/blackwall-proto" }
+blackwall-audit = { path = "crates/blackwall-audit" }
+blackwall-policy = { path = "crates/blackwall-policy" }
+blackwall-secrets = { path = "crates/blackwall-secrets" }
+blackwall-oci = { path = "crates/blackwall-oci" }
+blackwall-unpacker = { path = "crates/blackwall-unpacker" }
+blackwall-vmm = { path = "crates/blackwall-vmm" }
+blackwall-vmm-linux = { path = "crates/blackwall-vmm-linux" }
+blackwall-proxy = { path = "crates/blackwall-proxy" }
+blackwall-core = { path = "crates/blackwall-core" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+toml = "0.8"
+tokio = { version = "1", features = ["full"] }
+libc = "0.2"
+base64 = "0.22"
+hex = "0.4"
+sha2 = "0.10"
+hmac = "0.12"
+pbkdf2 = "0.12"
+rand = "0.8"
+zeroize = { version = "1", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+flate2 = "1"
+tar = "0.4"
+tempfile = "3"
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+panic = "abort"
+overflow-checks = true
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
