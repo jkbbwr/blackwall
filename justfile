@@ -341,6 +341,18 @@ build: build-ui
 build-release: check-deps build-kernel build-ui
     RUSTFLAGS="-D warnings" cargo build --release --bin blackwall-daemon --bin blackwall-proxy --bin blackwall
 
+# Build release host binaries and install blackwall, blackwall-daemon, and blackwall-proxy into ~/.local/bin
+install prefix="~/.local/bin":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dest="{{prefix}}"
+    dest="${dest/#\~/$HOME}"
+    RUSTFLAGS="-D warnings" cargo build --release --bin blackwall --bin blackwall-daemon --bin blackwall-proxy
+    mkdir -p "$dest"
+    install -m 0755 target/release/blackwall target/release/blackwall-daemon target/release/blackwall-proxy "$dest/"
+    echo "Installed into $dest:"
+    ls -lh "$dest/blackwall" "$dest/blackwall-daemon" "$dest/blackwall-proxy"
+
 # Package a self-contained release tarball + SHA256SUMS into dist/
 package-release: build-release
     #!/usr/bin/env bash
