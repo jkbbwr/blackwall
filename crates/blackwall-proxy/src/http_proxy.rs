@@ -29,12 +29,15 @@ use blackwall_audit::{AuditEvent, AuditEventKind, AuditSink};
 use blackwall_policy::{AuthSpec, HttpRule};
 use bytes::Bytes;
 use pingora_core::listeners::tls::TlsSettings;
+use pingora_core::listeners::TlsAccept;
+use pingora_core::protocols::tls::TlsRef;
 use pingora_core::server::configuration::ServerConf;
 use pingora_core::services::listening::Service;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_error::{Error, ErrorType, Result as PingoraResult};
 use pingora_http::RequestHeader;
 use pingora_proxy::{http_proxy_service, HttpProxy, ProxyHttp, Session};
+use std::any::Any;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -123,6 +126,14 @@ impl PolicyRejection {
     fn payload_too_large(reason: impl Into<String>) -> Self {
         Self {
             status: 413,
+            reason: reason.into(),
+            is_auth_mismatch: false,
+        }
+    }
+
+    fn misdirected(reason: impl Into<String>) -> Self {
+        Self {
+            status: 421,
             reason: reason.into(),
             is_auth_mismatch: false,
         }
@@ -261,7 +272,113 @@ fn extract_guest_placeholder(req: &RequestHeader, auth: &AuthSpec) -> Option<Str
     }
 }
 
-/// Evaluate an HTTP request against `rules`, `pinned_hosts`, and `secrets`.
+/// Best-effort percent-decoding for URI/query placeholder exfiltration scanning.
+fn percent_decode_lossy(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Returns `true` when `(hdr_name_lower, secret_name)` is the explicitly authorized header slot
+/// for `matched_auth` (where the placeholder is verified and stripped/replaced by the proxy).
+fn is_authorized_placeholder_header(
+    hdr_name_lower: &str,
+    secret_name: &str,
+    matched_auth: Option<&AuthSpec>,
+) -> bool {
+    let Some(auth) = matched_auth else {
+        return false;
+    };
+    if auth.secret_name() != secret_name {
+        return false;
+    }
+    match auth {
+        AuthSpec::Bearer { .. } => hdr_name_lower == "authorization" || hdr_name_lower == "x-api-key",
+        AuthSpec::Header { name, .. } => hdr_name_lower.eq_ignore_ascii_case(name),
+        AuthSpec::Basic { .. } => hdr_name_lower == "authorization",
+    }
+}
+
+/// Scan the request URI/query string and ALL HTTP headers for any registered guest secret
+/// placeholder appearing outside its authorized `AuthSpec` header slot.
+fn find_leaked_placeholder_in_request(
+    req: &RequestHeader,
+    matched_auth: Option<&AuthSpec>,
+    secrets: &dyn SecretResolver,
+) -> Option<(String, String)> {
+    let placeholders: Vec<(String, String)> = secrets
+        .all_placeholders()
+        .into_iter()
+        .filter(|(_, ph)| !ph.is_empty())
+        .collect();
+    if placeholders.is_empty() {
+        return None;
+    }
+
+    // 1. Scan raw and percent-decoded request URI (path + query string)
+    if let Some(pq) = req.uri.path_and_query() {
+        let raw_pq = pq.as_str();
+        let decoded_pq = percent_decode_lossy(raw_pq);
+        for (secret_name, ph) in &placeholders {
+            if raw_pq.contains(ph.as_str()) || decoded_pq.contains(ph.as_str()) {
+                return Some((secret_name.clone(), "request URI/query".to_string()));
+            }
+        }
+    }
+
+    // 2. Scan all headers (including decoded Basic auth values)
+    for (name, val) in req.headers.iter() {
+        let hdr_lower = name.as_str().to_ascii_lowercase();
+        let Ok(val_str) = val.to_str() else {
+            continue;
+        };
+        let basic_decoded = val_str
+            .trim()
+            .strip_prefix("Basic ")
+            .or_else(|| val_str.trim().strip_prefix("basic "))
+            .and_then(|b64| BASE64.decode(b64.trim()).ok())
+            .and_then(|raw| String::from_utf8(raw).ok());
+
+        for (secret_name, ph) in &placeholders {
+            if is_authorized_placeholder_header(&hdr_lower, secret_name, matched_auth) {
+                continue;
+            }
+            let in_raw = val_str.contains(ph.as_str());
+            let in_basic = basic_decoded
+                .as_deref()
+                .map(|s| s.contains(ph.as_str()))
+                .unwrap_or(false);
+            if in_raw || in_basic {
+                return Some((secret_name.clone(), format!("header '{hdr_lower}'")));
+            }
+        }
+    }
+
+    None
+}
+
+/// Evaluate an HTTP request against `rules`, `pinned_hosts`, and `secrets` (without TLS SNI).
 ///
 /// Pure policy/auth decision function reusable both inside Pingora's `request_filter`
 /// and in unit tests.
@@ -271,8 +388,31 @@ pub fn evaluate_http_request(
     pinned_hosts: &PinnedHostMap,
     secrets: &dyn SecretResolver,
 ) -> std::result::Result<PolicyDecision, PolicyRejection> {
+    evaluate_http_request_with_sni(req, None, rules, pinned_hosts, secrets)
+}
+
+/// Evaluate an HTTP request against `rules`, `pinned_hosts`, `secrets`, and an optional
+/// downstream TLS SNI hostname (enforcing `SNI == Host` to block cross-host domain fronting).
+pub fn evaluate_http_request_with_sni(
+    req: &RequestHeader,
+    downstream_sni: Option<&str>,
+    rules: &[HttpRule],
+    pinned_hosts: &PinnedHostMap,
+    secrets: &dyn SecretResolver,
+) -> std::result::Result<PolicyDecision, PolicyRejection> {
     let (host, req_port) = extract_host_and_port(req)
         .ok_or_else(|| PolicyRejection::forbidden("missing or invalid Host header"))?;
+
+    // 0. Enforce TLS SNI == HTTP Host header when downstream TLS SNI is present
+    if let Some(sni) = downstream_sni {
+        let norm_sni = sni.trim().trim_end_matches('.').to_ascii_lowercase();
+        if !norm_sni.is_empty() && !norm_sni.eq_ignore_ascii_case(&host) {
+            return Err(PolicyRejection::misdirected(format!(
+                "TLS SNI '{norm_sni}' does not match HTTP Host '{host}'"
+            )));
+        }
+    }
+
     let method = req.method.as_str().to_ascii_uppercase();
     let path = req.uri.path();
 
@@ -318,6 +458,15 @@ pub fn evaluate_http_request(
             ))
         })?
         .clone();
+
+    // 3b. Global secret placeholder exfiltration check across URI/query & all headers
+    if let Some((leaked_secret, location)) =
+        find_leaked_placeholder_in_request(req, matched_rule.auth.as_ref(), secrets)
+    {
+        return Err(PolicyRejection::auth_mismatch(format!(
+            "placeholder for secret '{leaked_secret}' is not permitted in {location} for '{host}{path}'"
+        )));
+    }
 
     // 4. Content-Length check against max_request_bytes (streaming body also enforced in request_body_filter)
     if let Some(limit) = matched_rule.max_request_bytes {
@@ -430,6 +579,28 @@ pub fn apply_auth_rewrite(upstream_req: &mut RequestHeader, decision: &PolicyDec
     }
 }
 
+/// Downstream TLS SNI captured during rustls handshake completion and stored in `SslDigest`.
+#[derive(Debug, Clone)]
+struct DownstreamTlsSni(String);
+
+/// Pingora `TlsAccept` callback that records the downstream ClientHello SNI onto `SslDigest`.
+struct SniCaptureCallback;
+
+#[async_trait]
+impl TlsAccept for SniCaptureCallback {
+    async fn handshake_complete_callback(&self, tls: &TlsRef) -> Option<Arc<dyn Any + Send + Sync>> {
+        let sni = tls
+            .server_name()?
+            .trim()
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        if sni.is_empty() {
+            return None;
+        }
+        Some(Arc::new(DownstreamTlsSni(sni)))
+    }
+}
+
 /// Per-request state carried across Pingora `ProxyHttp` phases.
 #[derive(Default)]
 pub struct ProxyRequestCtx {
@@ -441,6 +612,39 @@ pub struct ProxyRequestCtx {
     pub response_bytes: u64,
     pub status: u16,
     pub auth_injected: bool,
+    /// Trailing bytes from previous request body chunks so placeholders split across chunks are detected.
+    pub body_scan_tail: Vec<u8>,
+}
+
+/// Scan a streaming request body chunk (combined with `tail`) for any registered placeholder.
+fn scan_body_chunk_for_placeholder(
+    tail: &mut Vec<u8>,
+    chunk: &[u8],
+    placeholders: &[(String, String)],
+) -> Option<String> {
+    let max_len = placeholders.iter().map(|(_, p)| p.len()).max().unwrap_or(0);
+    if max_len == 0 {
+        return None;
+    }
+
+    let mut window = Vec::with_capacity(tail.len().saturating_add(chunk.len()));
+    window.extend_from_slice(tail);
+    window.extend_from_slice(chunk);
+
+    for (secret_name, ph) in placeholders {
+        let needle = ph.as_bytes();
+        if !needle.is_empty() && window.windows(needle.len()).any(|w| w == needle) {
+            return Some(secret_name.clone());
+        }
+    }
+
+    let keep = max_len.saturating_sub(1);
+    tail.clear();
+    if keep > 0 && !window.is_empty() {
+        let start = window.len().saturating_sub(keep);
+        tail.extend_from_slice(&window[start..]);
+    }
+    None
 }
 
 /// Pingora [`ProxyHttp`] implementation enforcing Blackwall HTTP policy, resolver-pinned
@@ -489,8 +693,15 @@ impl ProxyHttp for BlackwallHttpProxy {
             .map(|(h, _)| h)
             .unwrap_or_default();
 
-        match evaluate_http_request(
+        let downstream_sni = session
+            .digest()
+            .and_then(|d| d.ssl_digest.as_ref())
+            .and_then(|s| s.extension.get::<DownstreamTlsSni>())
+            .map(|s| s.0.as_str());
+
+        match evaluate_http_request_with_sni(
             req_header,
+            downstream_sni,
             &self.config.rules,
             &self.config.pinned_hosts,
             self.secrets.as_ref(),
@@ -568,6 +779,27 @@ impl ProxyHttp for BlackwallHttpProxy {
                     ));
                 }
             }
+
+            // Scan streaming request body for guest secret placeholder exfiltration
+            let placeholders = self.secrets.all_placeholders();
+            if let Some(leaked_secret) =
+                scan_body_chunk_for_placeholder(&mut ctx.body_scan_tail, chunk, &placeholders)
+            {
+                let reason = format!(
+                    "placeholder for secret '{leaked_secret}' is not permitted in request body for '{}{}'",
+                    ctx.host, ctx.path
+                );
+                ctx.status = 403;
+                self.audit_sink.record(AuditEvent::now(
+                    &self.config.sandbox_id,
+                    AuditEventKind::AuthMismatch {
+                        host: ctx.host.clone(),
+                        path: ctx.path.clone(),
+                        reason: reason.clone(),
+                    },
+                ));
+                return Err(Error::explain(ErrorType::HTTPStatus(403), reason));
+            }
         }
         Ok(())
     }
@@ -632,9 +864,10 @@ pub fn build_pingora_http_service(
     let mut service = http_proxy_service(&conf, proxy);
 
     if let Some(ca) = mitm_ca {
-        let mut tls_settings = TlsSettings::intermediate("", "").map_err(|e| {
-            crate::error::ProxyError::Tls(format!("failed to create Pingora TlsSettings: {e}"))
-        })?;
+        let mut tls_settings =
+            TlsSettings::with_callbacks(Box::new(SniCaptureCallback)).map_err(|e| {
+                crate::error::ProxyError::Tls(format!("failed to create Pingora TlsSettings: {e}"))
+            })?;
         tls_settings.set_cert_resolver(ca);
         tls_settings.enable_h2();
         service.add_tls_with_settings(listen_addr, None, tls_settings);
@@ -1083,5 +1316,128 @@ mod tests {
             )),
             "expected successful HttpRequest with auth_injected=true in audit log: {events:?}"
         );
+    }
+
+    #[test]
+    fn rejects_sni_host_mismatch_with_421() {
+        let mut rules = sample_rules();
+        rules.push(HttpRule {
+            host: "example.com".into(),
+            port: 443,
+            methods: vec!["GET".into()],
+            path_prefixes: vec!["/".into()],
+            max_request_bytes: None,
+            auth: None,
+        });
+        let mut pinned = PinnedHostMap::new();
+        pinned.insert("example.com".into(), vec!["93.184.216.34:443".parse().unwrap()]);
+        let secrets = sample_secrets();
+
+        let req = make_req("GET", "/", "example.com", &[]);
+        // Matching SNI succeeds
+        assert!(evaluate_http_request_with_sni(
+            &req,
+            Some("example.com"),
+            &rules,
+            &pinned,
+            secrets.as_ref()
+        )
+        .is_ok());
+
+        // Mismatched SNI (domain fronting between two allowlisted hosts) -> 421 Misdirected Request
+        let rej = evaluate_http_request_with_sni(
+            &req,
+            Some("api.github.com"),
+            &rules,
+            &pinned,
+            secrets.as_ref(),
+        )
+        .unwrap_err();
+        assert_eq!(rej.status, 421);
+        assert!(rej.reason.contains("does not match"));
+    }
+
+    #[test]
+    fn blocks_placeholder_exfiltration_on_unauthenticated_rules_and_chunked_bodies() {
+        let mut rules = sample_rules();
+        rules.push(HttpRule {
+            host: "example.com".into(),
+            port: 443,
+            methods: vec!["GET".into(), "POST".into()],
+            path_prefixes: vec!["/".into()],
+            max_request_bytes: None,
+            auth: None,
+        });
+        let mut pinned = PinnedHostMap::new();
+        pinned.insert("example.com".into(), vec!["93.184.216.34:443".parse().unwrap()]);
+        pinned.insert(
+            "api.github.com".into(),
+            vec!["140.82.121.6:443".parse().unwrap()],
+        );
+        let secrets = sample_secrets();
+
+        // 1. Authorization header on unauthenticated rule -> 403 auth_mismatch
+        let req_auth = make_req(
+            "GET",
+            "/",
+            "example.com",
+            &[("authorization", "Bearer ghp_bw00_placeholder_token")],
+        );
+        let rej = evaluate_http_request(&req_auth, &rules, &pinned, secrets.as_ref()).unwrap_err();
+        assert_eq!(rej.status, 403);
+        assert!(rej.is_auth_mismatch);
+
+        // 2. Custom header on unauthenticated rule -> 403 auth_mismatch
+        let req_hdr = make_req(
+            "POST",
+            "/leak",
+            "example.com",
+            &[("x-leak", "ghp_bw00_placeholder_token")],
+        );
+        let rej = evaluate_http_request(&req_hdr, &rules, &pinned, secrets.as_ref()).unwrap_err();
+        assert_eq!(rej.status, 403);
+        assert!(rej.is_auth_mismatch);
+
+        // 3. Query string (raw and percent-encoded) -> 403 auth_mismatch
+        let req_q = make_req(
+            "GET",
+            "/?s=ghp_bw00_placeholder_token",
+            "example.com",
+            &[],
+        );
+        let rej = evaluate_http_request(&req_q, &rules, &pinned, secrets.as_ref()).unwrap_err();
+        assert_eq!(rej.status, 403);
+        assert!(rej.is_auth_mismatch);
+
+        let req_q_enc = make_req(
+            "GET",
+            "/?s=ghp%5Fbw00%5Fplaceholder%5Ftoken",
+            "example.com",
+            &[],
+        );
+        let rej = evaluate_http_request(&req_q_enc, &rules, &pinned, secrets.as_ref()).unwrap_err();
+        assert_eq!(rej.status, 403);
+        assert!(rej.is_auth_mismatch);
+
+        // 4. Placeholder in custom header even on an authenticated rule -> 403 auth_mismatch
+        let req_extra = make_req(
+            "POST",
+            "/repos/my-org/my-repo/issues",
+            "api.github.com",
+            &[
+                ("authorization", "Bearer ghp_bw00_placeholder_token"),
+                ("x-exfil", "ghp_bw00_placeholder_token"),
+            ],
+        );
+        let rej = evaluate_http_request(&req_extra, &rules, &pinned, secrets.as_ref()).unwrap_err();
+        assert_eq!(rej.status, 403);
+        assert!(rej.is_auth_mismatch);
+
+        // 5. Cross-chunk request body placeholder scan detects split placeholder
+        let placeholders = secrets.all_placeholders();
+        let mut tail = Vec::new();
+        assert!(scan_body_chunk_for_placeholder(&mut tail, b"hello ghp_bw00_", &placeholders).is_none());
+        let hit = scan_body_chunk_for_placeholder(&mut tail, b"placeholder_token world", &placeholders);
+        assert_eq!(hit.as_deref(), Some("GITHUB_TOKEN"));
     }
 }

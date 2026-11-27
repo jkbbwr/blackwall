@@ -75,6 +75,10 @@ impl SecretResolver for VmSecretTableBridge {
             .get_placeholder(secret_name)
             .map(ToOwned::to_owned)
     }
+
+    fn all_placeholders(&self) -> Vec<(String, String)> {
+        self.table.guest_placeholders().into_iter().collect()
+    }
 }
 
 #[cfg(test)]

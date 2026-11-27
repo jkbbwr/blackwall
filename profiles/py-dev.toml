@@ -20,9 +20,10 @@ packages = [
 ]
 run = [
   "curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh",
-  "uv tool install --tool-dir /usr/local/share/uv-tools --bin-dir /usr/local/bin ruff",
-  "uv tool install --tool-dir /usr/local/share/uv-tools --bin-dir /usr/local/bin pytest",
-  "uv tool install --tool-dir /usr/local/share/uv-tools --bin-dir /usr/local/bin mypy",
+  "env UV_TOOL_DIR=/usr/local/share/uv-tools UV_TOOL_BIN_DIR=/usr/local/bin uv tool install ruff",
+  "env UV_TOOL_DIR=/usr/local/share/uv-tools UV_TOOL_BIN_DIR=/usr/local/bin uv tool install pytest",
+  "env UV_TOOL_DIR=/usr/local/share/uv-tools UV_TOOL_BIN_DIR=/usr/local/bin uv tool install mypy",
+  "chmod -R a+rX /usr/local/share/uv-tools",
   "mkdir -p /workspace /home/sandbox && useradd -m -u 1000 -s /bin/bash sandbox 2>/dev/null || true && chown -R 1000:1000 /workspace /home/sandbox",
 ]
 

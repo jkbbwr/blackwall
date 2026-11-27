@@ -31,6 +31,10 @@ pub trait SecretResolver: Send + Sync {
 
     /// Return the guest-visible placeholder for `secret_name`, if registered.
     fn placeholder_for(&self, secret_name: &str) -> Option<String>;
+
+    /// Return all registered `(secret_name, guest_placeholder)` pairs for outbound
+    /// placeholder exfiltration detection across headers, query strings, and bodies.
+    fn all_placeholders(&self) -> Vec<(String, String)>;
 }
 
 struct SecretRecord {
@@ -92,6 +96,13 @@ impl SecretResolver for InMemorySecretResolver {
         self.entries
             .get(secret_name)
             .map(|rec| rec.placeholder.clone())
+    }
+
+    fn all_placeholders(&self) -> Vec<(String, String)> {
+        self.entries
+            .iter()
+            .map(|(name, rec)| (name.clone(), rec.placeholder.clone()))
+            .collect()
     }
 }
 

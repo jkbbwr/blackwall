@@ -336,7 +336,7 @@ fn switch_root(newroot: &str) -> io::Result<()> {
 
 fn mount_essential_filesystems() -> io::Result<()> {
     let mounts: &[(&str, &str, &str, libc::c_ulong, Option<&str>)] = &[
-        ("proc", "/proc", "proc", libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV, None),
+        ("proc", "/proc", "proc", libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV, Some("hidepid=2")),
         ("sysfs", "/sys", "sysfs", libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV, None),
         ("devtmpfs", "/dev", "devtmpfs", libc::MS_NOSUID, Some("mode=0755")),
         ("devpts", "/dev/pts", "devpts", libc::MS_NOSUID | libc::MS_NOEXEC, Some("gid=5,mode=620")),
