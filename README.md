@@ -50,6 +50,7 @@ SEALED=$(printf '%s' "$MY_API_KEY" | ./target/release/blackwall secret seal --ra
 
 ## Documentation
 
+- [Agent Skill (`SKILL.md`)](.agents/skills/blackwall/SKILL.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Threat Model](docs/THREAT_MODEL.md)
 - [API Reference](docs/API.md)
