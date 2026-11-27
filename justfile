@@ -82,11 +82,37 @@ check-deps:
     clang_ver=""
     if command -v clang >/dev/null 2>&1; then
         clang_ver="$(clang --version | head -n 1)"
+        clang_major="$(clang -dumpversion 2>/dev/null | cut -d. -f1 || true)"
+        if [ -n "$clang_major" ] && [ "$clang_major" -lt 22 ] 2>/dev/null; then
+            warnings+=("clang ${clang_major} < 22 (Linux 7.3 KMALLOC_PARTITION_TYPED requires Clang 22+)")
+        fi
     fi
     check_cmd clang "$clang_ver"
-    for cmd in ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-readelf llvm-strip make flex bison bc perl python3 cpio gzip xz tar curl; do
+    check_cmd ld.lld "from lld"
+    for cmd in llvm-config llvm-ar llvm-link llvm-nm llvm-objcopy llvm-objdump llvm-readelf llvm-strip; do
+        check_cmd "$cmd" "from llvm"
+    done
+    for cmd in make flex bison bc perl python3 cpio gzip xz tar curl; do
         check_cmd "$cmd"
     done
+    if command -v pkg-config >/dev/null 2>&1 || command -v pkgconf >/dev/null 2>&1; then
+        printf "  [ok]      %-20s %s\n" "pkg-config" "$(command -v pkg-config || command -v pkgconf)"
+    else
+        printf "  [MISSING] %-20s (pkg-config / pkgconf)\n" "pkg-config"
+        missing+=("pkg-config")
+    fi
+    if (command -v pkg-config >/dev/null 2>&1 && pkg-config --exists libelf 2>/dev/null) || [ -f /usr/include/gelf.h ] || [ -f /usr/include/libelf.h ]; then
+        printf "  [ok]      %-20s headers found\n" "libelf-dev"
+    else
+        printf "  [MISSING] %-20s (libelf.h / gelf.h for kernel objtool)\n" "libelf-dev"
+        missing+=("libelf-dev")
+    fi
+    if (command -v pkg-config >/dev/null 2>&1 && pkg-config --exists openssl 2>/dev/null) || [ -f /usr/include/openssl/ssl.h ]; then
+        printf "  [ok]      %-20s headers found\n" "openssl-dev"
+    else
+        printf "  [MISSING] %-20s (openssl/ssl.h)\n" "openssl-dev"
+        missing+=("openssl-dev")
+    fi
 
     echo ""
     echo "Dashboard UI:"
@@ -174,7 +200,7 @@ install-deps platform="":
             cat <<EOF
     # 1. Core build, kernel, sandbox, and UI packages
     sudo pacman -S --needed \\
-      rustup clang lld llvm make flex bison bc perl python cpio gzip xz tar curl \\
+      rustup clang lld llvm pkgconf make flex bison bc perl python cpio gzip xz tar curl \\
       libelf openssl passt nftables erofs-utils cryptsetup podman nodejs pnpm
 
     # 2. Cloud Hypervisor (AUR, or grab the official static release binary)
@@ -188,7 +214,7 @@ install-deps platform="":
             cat <<EOF
     # 1. Core build, kernel, sandbox, and container packages
     sudo apt-get update && sudo apt-get install -y \\
-      clang lld llvm make flex bison bc perl python3 cpio gzip xz-utils tar curl \\
+      clang lld llvm pkg-config make flex bison bc perl python3 cpio gzip xz-utils tar curl \\
       libelf-dev libssl-dev passt nftables erofs-utils cryptsetup-bin podman nodejs npm
 
     # 2. Rust toolchain (if not installed) + pnpm
@@ -205,7 +231,7 @@ install-deps platform="":
             cat <<EOF
     # 1. Core build, kernel, sandbox, and UI packages
     sudo dnf install -y \\
-      rustup clang lld llvm make flex bison bc perl python3 cpio gzip xz tar curl \\
+      rustup clang lld llvm pkgconf-pkg-config make flex bison bc perl python3 cpio gzip xz tar curl \\
       elfutils-libelf-devel openssl-devel cloud-hypervisor passt nftables \\
       erofs-utils cryptsetup podman nodejs pnpm
     EOF
@@ -214,7 +240,7 @@ install-deps platform="":
             cat <<EOF
     # 1. Core build, kernel, sandbox, and UI packages
     sudo zypper install -y \\
-      rustup clang lld llvm make flex bison bc perl python3 cpio gzip xz tar curl \\
+      rustup clang lld llvm pkg-config make flex bison bc perl python3 cpio gzip xz tar curl \\
       libelf-devel libopenssl-devel cloud-hypervisor passt nftables \\
       erofs-utils cryptsetup podman nodejs pnpm
     EOF
@@ -223,7 +249,7 @@ install-deps platform="":
             cat <<EOF
     # 1. Core build, kernel, sandbox, and UI packages
     sudo apk add \\
-      rustup clang lld llvm make flex bison bc perl python3 cpio gzip xz tar curl \\
+      rustup clang lld llvm pkgconf make flex bison bc perl python3 cpio gzip xz tar curl \\
       elfutils-dev openssl-dev passt nftables erofs-utils cryptsetup podman nodejs pnpm
 
     # 2. Cloud Hypervisor static release binary
@@ -236,9 +262,10 @@ install-deps platform="":
             cat <<EOF
     # Enter a shell with all Blackwall dependencies via nixpkgs
     nix shell \\
-      nixpkgs#rustup nixpkgs#clang nixpkgs#lld nixpkgs#llvm nixpkgs#gnumake \\
+      nixpkgs#rustup nixpkgs#clang nixpkgs#lld nixpkgs#llvm nixpkgs#pkg-config nixpkgs#gnumake \\
       nixpkgs#flex nixpkgs#bison nixpkgs#bc nixpkgs#perl nixpkgs#python3 \\
       nixpkgs#cpio nixpkgs#gzip nixpkgs#xz nixpkgs#gnutar nixpkgs#curl \\
+      nixpkgs#elfutils nixpkgs#openssl \\
       nixpkgs#cloud-hypervisor nixpkgs#passt nixpkgs#nftables nixpkgs#erofs-utils \\
       nixpkgs#cryptsetup nixpkgs#podman nixpkgs#nodejs nixpkgs#pnpm
     EOF
