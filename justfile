@@ -13,36 +13,256 @@ audit_log := env("BLACKWALL_AUDIT_LOG", "/tmp/blackwall-audit.jsonl")
 default:
     @just --list
 
-# Check required host build & runtime dependencies
+# Check ALL required host build & runtime dependencies in a single pass
 check-deps:
     #!/usr/bin/env bash
     set -euo pipefail
-    echo "Checking Blackwall host toolchain ({{arch}})..."
-    for cmd in rustc cargo clang lld cloud-hypervisor pasta nft mkfs.erofs veritysetup pnpm curl tar; do
+    missing=()
+    warnings=()
+
+    check_cmd() {
+        local cmd="$1"
+        local note="${2:-}"
         if command -v "$cmd" >/dev/null 2>&1; then
-            printf "  [ok] %-18s %s\n" "$cmd" "$(command -v "$cmd")"
+            if [ -n "$note" ]; then
+                printf "  [ok]      %-20s %s (%s)\n" "$cmd" "$(command -v "$cmd")" "$note"
+            else
+                printf "  [ok]      %-20s %s\n" "$cmd" "$(command -v "$cmd")"
+            fi
         else
-            printf "  [MISSING] %s\n" "$cmd"
-            exit 1
+            printf "  [MISSING] %-20s%s\n" "$cmd" "${note:+ ($note)}"
+            missing+=("$cmd")
         fi
-    done
+    }
+
+    echo "Checking Blackwall host toolchain ({{arch}})..."
+
+    echo ""
+    echo "Runtime & Sandbox:"
+    check_cmd cloud-hypervisor
+    check_cmd pasta "from passt"
+    check_cmd nft "from nftables"
+    check_cmd mkfs.erofs "from erofs-utils"
+    check_cmd veritysetup "from cryptsetup"
     if command -v docker >/dev/null 2>&1 || command -v podman >/dev/null 2>&1; then
-        printf "  [ok] %-18s %s\n" "oci-runtime" "$(command -v docker || command -v podman)"
+        printf "  [ok]      %-20s %s\n" "oci-runtime" "$(command -v docker || command -v podman)"
     else
-        echo "  [MISSING] docker or podman"
-        exit 1
+        printf "  [MISSING] %-20s (docker or podman)\n" "oci-runtime"
+        missing+=("docker|podman")
     fi
     if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
-        echo "  [ok] /dev/kvm           rw"
+        printf "  [ok]      %-20s rw\n" "/dev/kvm"
+    elif [ -e /dev/kvm ]; then
+        printf "  [WARN]    %-20s exists but not rw for %s (run: sudo usermod -aG kvm %s)\n" "/dev/kvm" "$USER" "$USER"
+        warnings+=("/dev/kvm permissions")
     else
-        echo "  [WARN] /dev/kvm is not rw for current user"
+        printf "  [WARN]    %-20s device missing (enable KVM virtualization)\n" "/dev/kvm"
+        warnings+=("/dev/kvm missing")
     fi
-    if rustup target list --installed | grep -qx "{{musl_target}}"; then
-        echo "  [ok] rustup target      {{musl_target}}"
+
+    echo ""
+    echo "Rust Toolchain:"
+    check_cmd rustc
+    check_cmd cargo
+    check_cmd rustup
+    if command -v rustup >/dev/null 2>&1; then
+        if rustup target list --installed | grep -qx "{{musl_target}}"; then
+            printf "  [ok]      %-20s installed\n" "{{musl_target}}"
+        else
+            printf "  [MISSING] %-20s (run: rustup target add {{musl_target}})\n" "{{musl_target}}"
+            missing+=("rustup-target:{{musl_target}}")
+        fi
     else
-        echo "  [MISSING] run: rustup target add {{musl_target}}"
+        printf "  [MISSING] %-20s (rustup not installed)\n" "{{musl_target}}"
+        missing+=("rustup-target:{{musl_target}}")
+    fi
+
+    echo ""
+    echo "Kernel & Initramfs Build (Linux {{kernel_version}}):"
+    clang_ver=""
+    if command -v clang >/dev/null 2>&1; then
+        clang_ver="$(clang --version | head -n 1)"
+    fi
+    check_cmd clang "$clang_ver"
+    for cmd in ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-readelf llvm-strip make flex bison bc perl python3 cpio gzip xz tar curl; do
+        check_cmd "$cmd"
+    done
+
+    echo ""
+    echo "Dashboard UI:"
+    check_cmd node
+    check_cmd pnpm
+
+    echo ""
+    if [ "${#warnings[@]}" -gt 0 ]; then
+        echo "Warnings (${#warnings[@]}): ${warnings[*]}"
+    fi
+    if [ "${#missing[@]}" -gt 0 ]; then
+        echo "Missing dependencies (${#missing[@]}): ${missing[*]}"
+        echo "Run \`just install-deps\` for platform-specific install commands."
         exit 1
     fi
+    echo "All dependencies OK!"
+
+# Detect host distro (or pass arch|debian|ubuntu|fedora|opensuse|alpine|nix) and print install commands
+install-deps platform="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    override="{{platform}}"
+    os_id=""
+    os_like=""
+    os_pretty=""
+
+    if [ -n "$override" ]; then
+        os_id="${override,,}"
+        os_pretty="override: $override"
+    elif [ -r /etc/os-release ]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        os_id="${ID:-}"
+        os_like="${ID_LIKE:-}"
+        os_pretty="${PRETTY_NAME:-${NAME:-$os_id}}"
+    else
+        os_id="$(uname -s | tr '[:upper:]' '[:lower:]')"
+        os_pretty="$os_id"
+    fi
+
+    family="unknown"
+    case "$os_id" in
+        arch|cachyos|endeavouros|manjaro|garuda|artix) family="arch" ;;
+        debian|ubuntu|pop|linuxmint|kali|raspbian)     family="debian" ;;
+        fedora|rhel|centos|rocky|almalinux|nobara)     family="fedora" ;;
+        opensuse*|sles|suse)                           family="opensuse" ;;
+        alpine)                                        family="alpine" ;;
+        nixos|nix)                                     family="nix" ;;
+        *)
+            case "$os_like" in
+                *arch*)                 family="arch" ;;
+                *debian*|*ubuntu*)      family="debian" ;;
+                *fedora*|*rhel*)        family="fedora" ;;
+                *suse*)                 family="opensuse" ;;
+                *)
+                    if command -v pacman >/dev/null 2>&1; then family="arch"
+                    elif command -v apt-get >/dev/null 2>&1; then family="debian"
+                    elif command -v dnf >/dev/null 2>&1; then family="fedora"
+                    elif command -v zypper >/dev/null 2>&1; then family="opensuse"
+                    elif command -v apk >/dev/null 2>&1; then family="alpine"
+                    elif command -v nix >/dev/null 2>&1; then family="nix"
+                    fi
+                    ;;
+            esac
+            ;;
+    esac
+
+    ch_arch="{{arch}}"
+    ch_bin="cloud-hypervisor-static"
+    if [ "$ch_arch" = "aarch64" ]; then
+        ch_bin="cloud-hypervisor-static-aarch64"
+    fi
+
+    echo "Detected platform: ${os_pretty} (family=${family}, arch=${ch_arch})"
+    echo "Run the following commands to install all Blackwall dependencies:"
+    echo ""
+
+    case "$family" in
+        arch)
+            aur_helper="paru"
+            if ! command -v paru >/dev/null 2>&1 && command -v yay >/dev/null 2>&1; then
+                aur_helper="yay"
+            fi
+            cat <<EOF
+    # 1. Core build, kernel, sandbox, and UI packages
+    sudo pacman -S --needed \\
+      rustup clang lld llvm make flex bison bc perl python cpio gzip xz tar curl \\
+      libelf openssl passt nftables erofs-utils cryptsetup podman nodejs pnpm
+
+    # 2. Cloud Hypervisor (AUR, or grab the official static release binary)
+    ${aur_helper} -S --needed cloud-hypervisor
+    # (Without AUR helper:)
+    # curl -fL https://github.com/cloud-hypervisor/cloud-hypervisor/releases/latest/download/${ch_bin} \\
+    #   -o ~/.local/bin/cloud-hypervisor && chmod +x ~/.local/bin/cloud-hypervisor
+    EOF
+            ;;
+        debian)
+            cat <<EOF
+    # 1. Core build, kernel, sandbox, and container packages
+    sudo apt-get update && sudo apt-get install -y \\
+      clang lld llvm make flex bison bc perl python3 cpio gzip xz-utils tar curl \\
+      libelf-dev libssl-dev passt nftables erofs-utils cryptsetup-bin podman nodejs npm
+
+    # 2. Rust toolchain (if not installed) + pnpm
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    sudo npm install -g pnpm
+
+    # 3. Cloud Hypervisor static release binary
+    mkdir -p ~/.local/bin
+    curl -fL https://github.com/cloud-hypervisor/cloud-hypervisor/releases/latest/download/${ch_bin} \\
+      -o ~/.local/bin/cloud-hypervisor && chmod +x ~/.local/bin/cloud-hypervisor
+    EOF
+            ;;
+        fedora)
+            cat <<EOF
+    # 1. Core build, kernel, sandbox, and UI packages
+    sudo dnf install -y \\
+      rustup clang lld llvm make flex bison bc perl python3 cpio gzip xz tar curl \\
+      elfutils-libelf-devel openssl-devel cloud-hypervisor passt nftables \\
+      erofs-utils cryptsetup podman nodejs pnpm
+    EOF
+            ;;
+        opensuse)
+            cat <<EOF
+    # 1. Core build, kernel, sandbox, and UI packages
+    sudo zypper install -y \\
+      rustup clang lld llvm make flex bison bc perl python3 cpio gzip xz tar curl \\
+      libelf-devel libopenssl-devel cloud-hypervisor passt nftables \\
+      erofs-utils cryptsetup podman nodejs pnpm
+    EOF
+            ;;
+        alpine)
+            cat <<EOF
+    # 1. Core build, kernel, sandbox, and UI packages
+    sudo apk add \\
+      rustup clang lld llvm make flex bison bc perl python3 cpio gzip xz tar curl \\
+      elfutils-dev openssl-dev passt nftables erofs-utils cryptsetup podman nodejs pnpm
+
+    # 2. Cloud Hypervisor static release binary
+    mkdir -p ~/.local/bin
+    curl -fL https://github.com/cloud-hypervisor/cloud-hypervisor/releases/latest/download/${ch_bin} \\
+      -o ~/.local/bin/cloud-hypervisor && chmod +x ~/.local/bin/cloud-hypervisor
+    EOF
+            ;;
+        nix)
+            cat <<EOF
+    # Enter a shell with all Blackwall dependencies via nixpkgs
+    nix shell \\
+      nixpkgs#rustup nixpkgs#clang nixpkgs#lld nixpkgs#llvm nixpkgs#gnumake \\
+      nixpkgs#flex nixpkgs#bison nixpkgs#bc nixpkgs#perl nixpkgs#python3 \\
+      nixpkgs#cpio nixpkgs#gzip nixpkgs#xz nixpkgs#gnutar nixpkgs#curl \\
+      nixpkgs#cloud-hypervisor nixpkgs#passt nixpkgs#nftables nixpkgs#erofs-utils \\
+      nixpkgs#cryptsetup nixpkgs#podman nixpkgs#nodejs nixpkgs#pnpm
+    EOF
+            ;;
+        *)
+            cat <<EOF
+    Could not guess package manager for '${os_pretty}'.
+    Pass a platform explicitly: just install-deps <arch|debian|ubuntu|fedora|opensuse|alpine|nix>
+
+    Required tools:
+      rustc cargo rustup clang lld llvm make flex bison bc perl python3 cpio gzip xz tar curl
+      cloud-hypervisor pasta(passt) nft(nftables) mkfs.erofs(erofs-utils) veritysetup(cryptsetup)
+      docker|podman node pnpm
+    EOF
+            ;;
+    esac
+
+    cat <<EOF
+
+    # Post-install: static musl Rust target & /dev/kvm access
+    rustup toolchain install stable && rustup target add {{musl_target}}
+    sudo usermod -aG kvm "\$USER"   # log out/in or run \`newgrp kvm\` if /dev/kvm is not rw
+    just check-deps
+    EOF
 
 # Ensure the static musl Rust target is installed
 setup-targets:
