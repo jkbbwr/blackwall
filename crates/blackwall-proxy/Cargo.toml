@@ -26,7 +26,9 @@ libc.workspace = true
 async-trait = "0.1"
 bytes = "1"
 http = "1"
+percent-encoding = "2"
 subtle = "2"
+url = "2"
 
 pingora-core = { version = "0.9", default-features = false, features = ["rustls"] }
 pingora-proxy = { version = "0.9", default-features = false, features = ["rustls"] }

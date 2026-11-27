@@ -28,6 +28,7 @@ use base64::Engine;
 use blackwall_audit::{AuditEvent, AuditEventKind, AuditSink};
 use blackwall_policy::{AuthSpec, HttpRule};
 use bytes::Bytes;
+use percent_encoding::percent_decode_str;
 use pingora_core::listeners::tls::TlsSettings;
 use pingora_core::listeners::TlsAccept;
 use pingora_core::protocols::tls::TlsRef;
@@ -41,6 +42,7 @@ use std::any::Any;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use url::Url;
 use zeroize::Zeroizing;
 
 /// Out-of-process resolver-pinned IP endpoints keyed by lowercase hostname (or `host:port`).
@@ -141,45 +143,55 @@ impl PolicyRejection {
 }
 
 /// Extract lowercase hostname and optional explicit port from an HTTP request header.
+///
+/// Rejects duplicate `Host` headers and validates host/port syntax via the WHATWG `url` parser.
 pub fn extract_host_and_port(req: &RequestHeader) -> Option<(String, Option<u16>)> {
-    if let Some(host_val) = req.headers.get("host").and_then(|v| v.to_str().ok()) {
-        if let Some(parsed) = parse_host_port(host_val) {
-            return Some(parsed);
+    let mut host_headers = req.headers.get_all("host").iter();
+    if let Some(first) = host_headers.next() {
+        // Reject ambiguous duplicate Host headers (HTTP request smuggling defense).
+        if host_headers.next().is_some() {
+            return None;
         }
+        let host_val = first.to_str().ok()?;
+        return parse_host_port(host_val);
     }
     if let Some(authority) = req.uri.authority() {
-        return Some((
-            authority.host().trim_end_matches('.').to_ascii_lowercase(),
-            authority.port_u16(),
-        ));
+        return parse_host_port(authority.as_str());
     }
     None
 }
 
 fn parse_host_port(raw: &str) -> Option<(String, Option<u16>)> {
     let trimmed = raw.trim();
-    if trimmed.is_empty() {
+    if trimmed.is_empty()
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains('@')
+        || trimmed.contains('?')
+        || trimmed.contains('#')
+        || trimmed.bytes().any(|b| b <= 0x20 || b == 0x7f)
+    {
         return None;
     }
-    if let Some(rest) = trimmed.strip_prefix('[') {
-        let end = rest.find(']')?;
-        let host = rest[..end].to_ascii_lowercase();
-        let after = &rest[end + 1..];
-        let port = if let Some(p) = after.strip_prefix(':') {
-            Some(p.parse::<u16>().ok()?)
+
+    // Parse with the WHATWG `url` crate so IPv6 brackets, IDNA/punycode, and port ranges
+    // are strictly validated without custom string-splitting edge cases.
+    let parsed = Url::parse(&format!("https://{trimmed}/")).ok()?;
+    let host_str = parsed.host_str()?;
+    let explicit_port = parsed.port().or_else(|| {
+        // `url::Url::port()` returns `None` when the explicit port equals the scheme default (443).
+        // Detect an explicit `:443` suffix so callers know a port was explicitly specified.
+        if trimmed.ends_with(":443") {
+            Some(443)
         } else {
             None
-        };
-        return Some((host, port));
-    }
-    if let Some((h, p)) = trimmed.rsplit_once(':') {
-        if !h.contains(':') {
-            if let Ok(port) = p.parse::<u16>() {
-                return Some((h.trim_end_matches('.').to_ascii_lowercase(), Some(port)));
-            }
         }
+    });
+    let normalized_host = host_str.trim_end_matches('.').to_ascii_lowercase();
+    if normalized_host.is_empty() {
+        return None;
     }
-    Some((trimmed.trim_end_matches('.').to_ascii_lowercase(), None))
+    Some((normalized_host, explicit_port))
 }
 
 /// Lookup an exact resolver-pinned [`SocketAddr`] for `(host, port)` without ever doing DNS.
@@ -208,16 +220,79 @@ pub fn lookup_pinned_addr(
     None
 }
 
-/// Normalize path (rejecting traversal segments like `/../`) and match against a policy prefix.
+/// Iteratively percent-decode a string (up to `max_rounds` or until stable) using
+/// `percent-encoding` so single-, double-, and triple-encoded bypass attempts are caught.
+fn decode_percent_iteratively(input: &str, max_rounds: usize) -> String {
+    let mut current = input.to_string();
+    for _ in 0..max_rounds {
+        let next = percent_decode_str(&current).decode_utf8_lossy().into_owned();
+        if next == current {
+            break;
+        }
+        current = next;
+    }
+    current
+}
+
+/// Normalize and validate an HTTP request path using the WHATWG `url` parser plus strict
+/// dot-segment, backslash, control-character, and multi-round percent-decoding checks.
+///
+/// Returns `None` if the path contains any traversal or parser-differential ambiguity
+/// (`..`, `.`, `\`, `%2e%2e`, `%2E%2E`, `..%2f`, `%252e%252e`, NUL/control chars, etc.)
+/// while preserving legitimate percent-encoded path tokens such as npm scoped packages
+/// (`/@types%2fnode`).
+pub fn canonicalize_and_validate_path(raw_path: &str) -> Option<String> {
+    if !raw_path.starts_with('/') {
+        return None;
+    }
+    // Reject raw backslashes, NUL bytes, and ASCII control characters immediately.
+    if raw_path.contains('\\') || raw_path.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return None;
+    }
+
+    // Parse with the WHATWG `url` crate (normalizes %2e%2e, dot segments, backslashes, etc.).
+    let parsed = Url::parse(&format!("https://placeholder.invalid{raw_path}")).ok()?;
+    let canonical = parsed.path().to_string();
+    if !canonical.starts_with('/') {
+        return None;
+    }
+
+    // Reject dot-segments, backslashes, or control chars across raw, WHATWG-normalized,
+    // and iteratively percent-decoded forms (catches %2e%2e, %2E%2E, ..%2f, %252e%252e, %5c, %00).
+    let decoded = decode_percent_iteratively(raw_path, 3);
+    if decoded.contains('\\') || decoded.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return None;
+    }
+    for candidate in [raw_path, canonical.as_str(), decoded.as_str()] {
+        if candidate
+            .split(['/', '\\'])
+            .any(|seg| seg == "." || seg == "..")
+        {
+            return None;
+        }
+    }
+
+    // Reject if WHATWG dot-segment normalization changed the path length/structure unexpectedly
+    // (e.g. encoded dot segments that vanished during URL parsing).
+    if raw_path != canonical {
+        // Allow harmless case-only percent-encoding differences, reject structural shifts.
+        let raw_decoded_once = percent_decode_str(raw_path).decode_utf8_lossy();
+        let canon_decoded_once = percent_decode_str(&canonical).decode_utf8_lossy();
+        if raw_decoded_once != canon_decoded_once {
+            return None;
+        }
+    }
+
+    Some(canonical)
+}
+
+/// Validate and normalize `path`, then match both canonical and decoded forms against `prefix`.
 fn path_matches_prefix(path: &str, prefix: &str) -> bool {
-    if !path.starts_with('/') {
+    let Some(canonical) = canonicalize_and_validate_path(path) else {
         return false;
-    }
-    // Reject obvious dot-segment traversal attempts before prefix matching.
-    if path.split('/').any(|seg| seg == "..") {
-        return false;
-    }
-    path.starts_with(prefix)
+    };
+    let decoded = decode_percent_iteratively(&canonical, 3);
+    canonical.starts_with(prefix) && decoded.starts_with(prefix)
 }
 
 /// Extract the guest-presented placeholder token from `req` for a given [`AuthSpec`].
@@ -272,34 +347,6 @@ fn extract_guest_placeholder(req: &RequestHeader, auth: &AuthSpec) -> Option<Str
     }
 }
 
-/// Best-effort percent-decoding for URI/query placeholder exfiltration scanning.
-fn percent_decode_lossy(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
-                out.push((hi << 4) | lo);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn hex_val(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
 /// Returns `true` when `(hdr_name_lower, secret_name)` is the explicitly authorized header slot
 /// for `matched_auth` (where the placeholder is verified and stripped/replaced by the proxy).
 fn is_authorized_placeholder_header(
@@ -336,10 +383,10 @@ fn find_leaked_placeholder_in_request(
         return None;
     }
 
-    // 1. Scan raw and percent-decoded request URI (path + query string)
+    // 1. Scan raw and iteratively percent-decoded request URI (path + query string)
     if let Some(pq) = req.uri.path_and_query() {
         let raw_pq = pq.as_str();
-        let decoded_pq = percent_decode_lossy(raw_pq);
+        let decoded_pq = decode_percent_iteratively(raw_pq, 2);
         for (secret_name, ph) in &placeholders {
             if raw_pq.contains(ph.as_str()) || decoded_pq.contains(ph.as_str()) {
                 return Some((secret_name.clone(), "request URI/query".to_string()));
@@ -416,16 +463,30 @@ pub fn evaluate_http_request_with_sni(
     let method = req.method.as_str().to_ascii_uppercase();
     let path = req.uri.path();
 
-    // 1. Host filter
-    let host_rules: Vec<&HttpRule> = rules
+    // 1. Host & explicit port filter
+    let all_host_rules: Vec<&HttpRule> = rules
         .iter()
         .filter(|r| r.host.eq_ignore_ascii_case(&host))
         .collect();
-    if host_rules.is_empty() {
+    if all_host_rules.is_empty() {
         return Err(PolicyRejection::forbidden(format!(
             "host '{host}' is not allowlisted"
         )));
     }
+    let host_rules: Vec<&HttpRule> = if let Some(explicit_port) = req_port {
+        let port_matched: Vec<&HttpRule> = all_host_rules
+            .into_iter()
+            .filter(|r| r.port == explicit_port)
+            .collect();
+        if port_matched.is_empty() {
+            return Err(PolicyRejection::forbidden(format!(
+                "port {explicit_port} on host '{host}' is not allowlisted"
+            )));
+        }
+        port_matched
+    } else {
+        all_host_rules
+    };
 
     // 2. Path prefix filter (select longest matching prefix)
     let mut prefix_matches: Vec<&HttpRule> = host_rules
@@ -1439,5 +1500,75 @@ mod tests {
         assert!(scan_body_chunk_for_placeholder(&mut tail, b"hello ghp_bw00_", &placeholders).is_none());
         let hit = scan_body_chunk_for_placeholder(&mut tail, b"placeholder_token world", &placeholders);
         assert_eq!(hit.as_deref(), Some("GITHUB_TOKEN"));
+    }
+
+    #[test]
+    fn rejects_encoded_traversal_backslash_and_disallowed_explicit_ports() {
+        let mut rules = sample_rules();
+        rules.push(HttpRule {
+            host: "registry.npmjs.org".into(),
+            port: 443,
+            methods: vec!["GET".into()],
+            path_prefixes: vec!["/".into()],
+            max_request_bytes: None,
+            auth: None,
+        });
+        let mut pinned = PinnedHostMap::new();
+        pinned.insert(
+            "api.github.com".into(),
+            vec!["140.82.121.6:443".parse().unwrap()],
+        );
+        pinned.insert(
+            "registry.npmjs.org".into(),
+            vec!["104.16.25.34:443".parse().unwrap()],
+        );
+        let secrets = sample_secrets();
+
+        // All encoded/backslash/double-encoded/NUL traversal variants MUST be rejected
+        for bad_path in [
+            "/repos/my-org/my-repo/%2e%2e/other",
+            "/repos/my-org/my-repo/%2E%2E/other",
+            "/repos/my-org/my-repo/..%2fother",
+            "/repos/my-org/my-repo/%252e%252e/other",
+            "/repos/my-org/my-repo/%2e/other",
+            "/repos/my-org/my-repo\\..\\other",
+            "/repos/my-org/my-repo/%5c..%5cother",
+            "/repos/my-org/my-repo/ok%00evil",
+        ] {
+            assert!(
+                canonicalize_and_validate_path(bad_path).is_none(),
+                "expected traversal/malformed path to be rejected: {bad_path}"
+            );
+            assert!(
+                !path_matches_prefix(bad_path, "/repos/my-org/my-repo/"),
+                "expected prefix match to reject: {bad_path}"
+            );
+        }
+
+        // Legitimate npm scoped package path with %2f MUST still be allowed
+        assert!(path_matches_prefix("/@types%2fnode", "/"));
+        let npm_req = make_req("GET", "/@types%2fnode", "registry.npmjs.org", &[]);
+        assert!(evaluate_http_request(&npm_req, &rules, &pinned, secrets.as_ref()).is_ok());
+
+        // Explicit disallowed port in Host header (8443 vs allowed 443) -> 403
+        let bad_port_req = make_req(
+            "POST",
+            "/repos/my-org/my-repo/issues",
+            "api.github.com:8443",
+            &[("authorization", "Bearer ghp_bw00_placeholder_token")],
+        );
+        let rej =
+            evaluate_http_request(&bad_port_req, &rules, &pinned, secrets.as_ref()).unwrap_err();
+        assert_eq!(rej.status, 403);
+        assert!(rej.reason.contains("port 8443"));
+
+        // Explicit allowed port :443 in Host header -> allowed
+        let ok_port_req = make_req(
+            "POST",
+            "/repos/my-org/my-repo/issues",
+            "api.github.com:443",
+            &[("authorization", "Bearer ghp_bw00_placeholder_token")],
+        );
+        assert!(evaluate_http_request(&ok_port_req, &rules, &pinned, secrets.as_ref()).is_ok());
     }
 }
