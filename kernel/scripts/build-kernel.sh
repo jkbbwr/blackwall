@@ -520,6 +520,25 @@ build_profile() {
     tmp_dir="$(mktemp -d)"
     TMP_DIRS+=("${tmp_dir}")
 
+    # Select typed vs random kmalloc slab partitioning based on actual host clang support
+    # (Linux 7.3 KMALLOC_PARTITION_TYPED passes -falloc-token-max=16, which requires Clang 22+).
+    if [[ -n "${KERNEL_SRC}" ]]; then
+        local slab_frag="${tmp_dir}/kmalloc-partition.fragment"
+        if clang -Werror -falloc-token-max=16 -c -x c /dev/null -o "${tmp_dir}/alloc_token.o" >/dev/null 2>&1; then
+            {
+                printf 'CONFIG_KMALLOC_PARTITION_TYPED=y\n'
+                printf '# CONFIG_KMALLOC_PARTITION_RANDOM is not set\n'
+            } > "${slab_frag}"
+        else
+            log "Host clang does not support -falloc-token-max=16 (< Clang 22); using CONFIG_KMALLOC_PARTITION_RANDOM=y"
+            {
+                printf 'CONFIG_KMALLOC_PARTITION_RANDOM=y\n'
+                printf '# CONFIG_KMALLOC_PARTITION_TYPED is not set\n'
+            } > "${slab_frag}"
+        fi
+        fragments+=("${slab_frag}")
+    fi
+
     if [[ -n "${initramfs_path}" ]]; then
         local abs_initramfs
         abs_initramfs="$(cd "$(dirname "${initramfs_path}")" && pwd)/$(basename "${initramfs_path}")"
@@ -565,12 +584,14 @@ build_profile() {
     karch="$(kernel_arch_for "${ARCH}")"
     local build_dir="${OUT_DIR}/build-${profile}"
     mkdir -p "${build_dir}" "${OUT_DIR}"
+    rm -rf "${build_dir}/.config" "${build_dir}/include/config"
 
     log "Configuring vmlinux-${profile} (${ARCH} / ARCH=${karch}) via merge_config.sh"
     make -C "${abs_kernel_src}" O="${build_dir}" ARCH="${karch}" LLVM=1 LLVM_IAS=1 defconfig
     (
         cd "${abs_kernel_src}"
-        ARCH="${karch}" LLVM=1 LLVM_IAS=1 "${merge_script}" -O "${build_dir}" "${build_dir}/.config" "${fragments[@]}"
+        ARCH="${karch}" LLVM=1 LLVM_IAS=1 MAKEFLAGS="LLVM=1 LLVM_IAS=1" \
+            "${merge_script}" -O "${build_dir}" "${build_dir}/.config" "${fragments[@]}"
     )
     make -C "${abs_kernel_src}" O="${build_dir}" ARCH="${karch}" LLVM=1 LLVM_IAS=1 olddefconfig
 
