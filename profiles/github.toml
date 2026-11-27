@@ -1,0 +1,63 @@
+# Composable GitHub mixin profile (e.g. `blackwall create --profile ts-dev --profile github`).
+#
+# Provides git + GitHub CLI (`gh`) and read-only / git-smart-HTTP egress to GitHub.
+# To enable authenticated `gh` API calls or `git push` without exposing your real PAT to the VM,
+# seal your token offline and layer it at create time (or in a private local overlay profile):
+#
+#   SEALED=$(printf '%s' "$GH_PAT" | blackwall secret seal --raw \
+#     --name GITHUB_TOKEN --hosts api.github.com,github.com --paths / --exp-sec 7200)
+#   blackwall create --profile ts-dev --profile github \
+#     --secret "GITHUB_TOKEN=$SEALED" \
+#     --allow-http "GET,POST,PATCH:api.github.com/:GITHUB_TOKEN"
+
+version = 1
+name = "github"
+extends = ["base"]
+
+[image]
+base = "debian:bookworm-slim"
+packages = [
+  "ca-certificates",
+  "git",
+  "curl",
+  "jq",
+]
+run = [
+  "curl -fsSL https://github.com/cli/cli/releases/download/v2.67.0/gh_2.67.0_linux_amd64.tar.gz | tar -xz --strip-components=1 -C /usr/local",
+  "mkdir -p /workspace /home/sandbox && useradd -m -u 1000 -s /bin/bash sandbox 2>/dev/null || true && chown -R 1000:1000 /workspace /home/sandbox",
+]
+
+[network]
+mode = "egress"
+
+# Smart HTTP git clone/fetch (`git-upload-pack` uses POST on `/*.git/git-upload-pack`)
+[[network.http]]
+host = "github.com"
+methods = ["GET", "HEAD", "POST"]
+path_prefixes = ["/"]
+
+# Read-only GitHub REST API by default
+[[network.http]]
+host = "api.github.com"
+methods = ["GET", "HEAD"]
+path_prefixes = ["/"]
+
+[[network.http]]
+host = "raw.githubusercontent.com"
+methods = ["GET", "HEAD"]
+path_prefixes = ["/"]
+
+[[network.http]]
+host = "objects.githubusercontent.com"
+methods = ["GET", "HEAD"]
+path_prefixes = ["/"]
+
+[[network.http]]
+host = "codeload.github.com"
+methods = ["GET", "HEAD"]
+path_prefixes = ["/"]
+
+[env]
+GIT_TERMINAL_PROMPT = "0"
+GH_PROMPT_DISABLED = "1"
+GH_NO_UPDATE_NOTIFIER = "1"
