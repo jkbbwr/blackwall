@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Blackwall Reproducible Hardened Guest Kernel Builder (Linux 6.12+, Clang/LLVM)
+# Blackwall Reproducible Hardened Guest Kernel Builder (Linux 7.3+, Clang/LLVM)
 # Builds vmlinux-lo and/or vmlinux-noinet using `make LLVM=1 LLVM_IAS=1`.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -170,6 +170,8 @@ parse_args() {
 
     if [[ -z "${OUT_DIR}" ]]; then
         OUT_DIR="${KERNEL_DIR}/out/${ARCH}"
+    elif [[ "${OUT_DIR}" != /* ]]; then
+        OUT_DIR="$(pwd)/${OUT_DIR}"
     fi
 
     if [[ -z "${JOBS}" ]]; then
@@ -405,7 +407,9 @@ verify_resolved_config() {
     assert_cfg_eq "${cfg}" "CONFIG_VIRTIO_VSOCKETS" "y"
     assert_cfg_eq "${cfg}" "CONFIG_VIRTIO_VSOCKETS_COMMON" "y"
     assert_cfg_eq "${cfg}" "CONFIG_LTO_CLANG_THIN" "y"
-    assert_cfg_eq "${cfg}" "CONFIG_CFI_CLANG" "y"
+    assert_cfg_eq "${cfg}" "CONFIG_CFI" "y"
+    assert_cfg_eq "${cfg}" "CONFIG_KMALLOC_PARTITION_CACHES" "y"
+    assert_cfg_eq "${cfg}" "CONFIG_KMALLOC_PARTITION_TYPED" "y"
     assert_cfg_eq "${cfg}" "CONFIG_SYSVIPC" "y"
     assert_cfg_eq "${cfg}" "CONFIG_IPC_NS" "y"
     assert_cfg_eq "${cfg}" "CONFIG_BLK_DEV_INITRD" "y"

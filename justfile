@@ -2,7 +2,7 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 
 arch := `uname -m`
 musl_target := arch + "-unknown-linux-musl"
-kernel_version := env("BLACKWALL_KERNEL_VERSION", "6.12.119")
+kernel_version := env("BLACKWALL_KERNEL_VERSION", "7.3.6")
 kernel_src := "kernel/src/linux-" + kernel_version
 kernel_out := "kernel/out/" + arch
 jobs := `nproc`
@@ -59,7 +59,9 @@ fetch-kernel:
     if [ ! -d "{{kernel_src}}" ]; then
         mkdir -p kernel/src
         tarball="linux-{{kernel_version}}.tar.xz"
-        url="https://cdn.kernel.org/pub/linux/kernel/v6.x/$tarball"
+        major="${tarball#linux-}"
+        major="${major%%.*}"
+        url="https://cdn.kernel.org/pub/linux/kernel/v${major}.x/$tarball"
         echo "Downloading $url..."
         curl -fL "$url" -o "kernel/src/$tarball"
         tar -xJf "kernel/src/$tarball" -C kernel/src

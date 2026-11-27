@@ -80,7 +80,7 @@ ID=$(blackwall --json create \
   --vcpus 2 \
   --memory-mib 2048 \
   --idle-timeout-sec 900 \
-  | jq -r '.sandbox_id')
+  | jq -r '.id')
 
 blackwall --json inspect "$ID"
 ```

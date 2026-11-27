@@ -1,6 +1,6 @@
 # Blackwall — Hardened Guest Linux Kernel Specification
 
-Blackwall builds two minimal, reproducible Linux LTS guest kernels (`6.12+`) per target architecture (`x86_64` first, `aarch64` alongside/Phase 5), compiled with Clang/LLVM via **`make LLVM=1 LLVM_IAS=1`** (which auto-detects `CC_IS_CLANG` in Kbuild):
+Blackwall builds two minimal, reproducible hardened Linux guest kernels (`7.3+`) per target architecture (`x86_64` first, `aarch64` alongside/Phase 5), compiled with Clang/LLVM via **`make LLVM=1 LLVM_IAS=1`** (which auto-detects `CC_IS_CLANG` in Kbuild):
 
 1. **`vmlinux-lo` (Primary Default — used by `loopback` and `egress` modes):** Minimal `CONFIG_INET=y` + `CONFIG_TUN=y` with **zero hardware/virtio NICs, zero Netfilter, zero `AF_PACKET`, zero XFRM, zero `io_uring`**. Provides 100% native POSIX loopback (`127.0.0.1`, `::1`, `0.0.0.0`); in `egress` mode, non-loopback traffic routes through in-guest `tun0` -> `blackwall-netbridge` (`smoltcp`) -> `AF_VSOCK` `Port 1000`.
 2. **`vmlinux-noinet` (Strict Offline Profile — used by `none` mode):** Identical hardening baseline with **`CONFIG_INET=n`**, **`CONFIG_IPV6=n`**, and **`CONFIG_TUN=n`** — compiling out the entire TCP/IP stack while retaining `AF_UNIX` and `AF_VSOCK`.
@@ -105,12 +105,12 @@ CONFIG_IPC_NS=y
 
 ---
 
-## 3. KSPP, CFI & Speculation Mitigations (`Linux 6.12+`)
+## 3. KSPP, CFI & Speculation Mitigations (`Linux 7.3+`)
 
 ```kconfig
 # Clang ThinLTO & Fine-Grained KCFI (built with `make LLVM=1 LLVM_IAS=1`)
 CONFIG_LTO_CLANG_THIN=y
-CONFIG_CFI_CLANG=y
+CONFIG_CFI=y
 
 # Architecture-specific hardware protections
 # -- On x86_64 (Linux KVM servers; 6.9+ CONFIG_MITIGATION_* naming):
@@ -132,7 +132,8 @@ CONFIG_RODATA_FULL_DEFAULT_ENABLED=y
 CONFIG_SLAB_FREELIST_RANDOM=y
 CONFIG_SLAB_FREELIST_HARDENED=y
 CONFIG_SLAB_BUCKETS=y
-CONFIG_RANDOM_KMALLOC_CACHES=y
+CONFIG_KMALLOC_PARTITION_CACHES=y
+CONFIG_KMALLOC_PARTITION_TYPED=y
 CONFIG_SHUFFLE_PAGE_ALLOCATOR=y
 CONFIG_INIT_ON_ALLOC_DEFAULT_ON=y
 CONFIG_INIT_ON_FREE_DEFAULT_ON=y

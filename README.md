@@ -6,7 +6,7 @@ A 100% rootless Linux KVM microVM sandbox for running untrusted code and AI agen
 
 - **Zero root / zero sudo:** Every component runs as an unprivileged host user (`/dev/kvm` rw only).
 - **Hardware KVM boundary (`cloud-hypervisor`):** Each sandbox runs inside its own `userns`, empty `netns`, `pivot_root`, Landlock, `seccomp-bpf`, `CapEff=0`, `NoNewPrivs=1`, `PR_SET_DUMPABLE=0`. No `virtio-net` NIC and no `virtio-fs` — only `AF_VSOCK` (Ports 1000/1001/1002).
-- **Hardened Linux 6.12 guest kernels:** `vmlinux-lo` and `vmlinux-noinet` (`CONFIG_INET=n`) with `CONFIG_IO_URING=n`, `CONFIG_USER_NS=n`, `CONFIG_MODULES=n`, `CONFIG_BPF_SYSCALL=n`, `CONFIG_XFRM=n`, `CONFIG_KEXEC=n`.
+- **Hardened Linux 7.3 guest kernels:** `vmlinux-lo` and `vmlinux-noinet` (`CONFIG_INET=n`) with Clang ThinLTO + kCFI, type-partitioned kmalloc slabs, and `CONFIG_IO_URING=n`, `CONFIG_USER_NS=n`, `CONFIG_MODULES=n`, `CONFIG_BPF_SYSCALL=n`, `CONFIG_XFRM=n`, `CONFIG_KEXEC=n`.
 - **Two-disk storage model:**
   - `vda`: Read-only content-addressed `EROFS + dm-verity` rootfs (`setuid` & file capabilities stripped).
   - `vdb`: Ephemeral `dm-crypt` `ext4` mounted at `/workspace` (random in-RAM key discarded on VM exit).
